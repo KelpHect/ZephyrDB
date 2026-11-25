@@ -4,6 +4,67 @@
 
 namespace zephyr::core {
 
+AugmentedBTree::NodePool::NodePool() {
+    free_list_.reserve(256);
+}
+
+AugmentedBTree::NodePool::~NodePool() {
+    std::lock_guard<std::mutex> lk(pool_mu_);
+    for (Node* n : free_list_) {
+        delete n;
+    }
+    free_list_.clear();
+}
+
+AugmentedBTree::Node* AugmentedBTree::NodePool::alloc_node() {
+    Node* n = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(pool_mu_);
+        if (!free_list_.empty()) {
+            n = free_list_.back();
+            free_list_.pop_back();
+        }
+    }
+    if (!n) {
+        n = new Node();
+    }
+    return n;
+}
+
+void AugmentedBTree::NodePool::recycle_node(Node* n) noexcept {
+    if (!n) return;
+    n->refcount.store(1, std::memory_order_relaxed);
+    n->is_leaf = true;
+    n->num_keys = 0;
+    n->count = 0;
+    n->min_key = INT64_MAX;
+    n->max_key = INT64_MIN;
+    n->col_sum_i64.fill(0);
+    n->col_sum_f64.fill(0.0);
+    n->children.fill(nullptr);
+    {
+        std::lock_guard<std::mutex> lk(pool_mu_);
+        if (free_list_.size() < MAX_POOLED_NODES) {
+            free_list_.push_back(n);
+            return;
+        }
+    }
+    delete n;
+}
+
+AugmentedBTree::NodePool& AugmentedBTree::node_pool() noexcept {
+    static NodePool pool;
+    return pool;
+}
+
+AugmentedBTree::Node* AugmentedBTree::alloc_node() {
+    return node_pool().alloc_node();
+}
+
+void AugmentedBTree::recycle_node(Node* n) noexcept {
+    node_pool().recycle_node(n);
+}
+
 AugmentedBTree::AugmentedBTree(RcuReaper* reaper, cpp26::rcu::rcu_domain& dom)
     : reaper_(reaper), domain_(dom) {}
 
@@ -28,7 +89,7 @@ void AugmentedBTree::release_node(Node* n) noexcept {
                 release_node(n->children[i]);
             }
         }
-        delete n;
+        recycle_node(n);
     }
 }
 
@@ -46,7 +107,7 @@ void AugmentedBTree::retire_root(Node* old_root) {
 }
 
 AugmentedBTree::Node* AugmentedBTree::clone_node(const Node* src) {
-    Node* dst = new Node();
+    Node* dst = alloc_node();
     dst->refcount.store(1, std::memory_order_relaxed);
     dst->is_leaf = src->is_leaf;
     dst->num_keys = src->num_keys;
@@ -335,7 +396,7 @@ AugmentedBTree::InsertResult AugmentedBTree::insert_recursive(
         }
 
         constexpr size_t mid = (ORDER + 1) / 2;
-        Node* left = new Node();
+        Node* left = alloc_node();
         left->is_leaf = true;
         left->num_keys = static_cast<uint16_t>(mid);
         for (size_t i = 0; i < mid; ++i) {
@@ -345,7 +406,7 @@ AugmentedBTree::InsertResult AugmentedBTree::insert_recursive(
             left->row_f64[i] = tmp_f64[i];
         }
 
-        Node* right = new Node();
+        Node* right = alloc_node();
         right->is_leaf = true;
         right->num_keys = static_cast<uint16_t>((ORDER + 1) - mid);
         for (size_t i = mid; i < ORDER + 1; ++i) {
@@ -419,7 +480,7 @@ AugmentedBTree::InsertResult AugmentedBTree::insert_recursive(
     constexpr size_t mid = ORDER / 2;
     const int64_t promoted_key = tmp_keys[mid];
 
-    Node* left = new Node();
+    Node* left = alloc_node();
     left->is_leaf = false;
     left->num_keys = static_cast<uint16_t>(mid);
     for (size_t i = 0; i < mid; ++i) {
@@ -429,7 +490,7 @@ AugmentedBTree::InsertResult AugmentedBTree::insert_recursive(
         left->children[i] = tmp_children[i];
     }
 
-    Node* right = new Node();
+    Node* right = alloc_node();
     right->is_leaf = false;
     right->num_keys = static_cast<uint16_t>(ORDER - mid);
     for (size_t i = mid + 1; i <= ORDER; ++i) {
@@ -444,15 +505,14 @@ AugmentedBTree::InsertResult AugmentedBTree::insert_recursive(
     return {left, right, promoted_key, true};
 }
 
-void AugmentedBTree::upsert(int64_t key,
-                            uint64_t row_id,
-                            const std::array<int64_t, MAX_AGG_COLS>& i64_vals,
-                            const std::array<double, MAX_AGG_COLS>& f64_vals) {
-    std::lock_guard<std::mutex> lk(write_mu_);
-    Node* old_root = root_.load(std::memory_order_acquire);
-
-    if (!old_root) {
-        Node* leaf = new Node();
+AugmentedBTree::Node* AugmentedBTree::upsert_into_root(
+    const Node* root,
+    int64_t key,
+    uint64_t row_id,
+    const std::array<int64_t, MAX_AGG_COLS>& i64_vals,
+    const std::array<double, MAX_AGG_COLS>& f64_vals) {
+    if (!root) {
+        Node* leaf = alloc_node();
         leaf->is_leaf = true;
         leaf->num_keys = 1;
         leaf->keys[0] = key;
@@ -460,25 +520,52 @@ void AugmentedBTree::upsert(int64_t key,
         leaf->row_i64[0] = i64_vals;
         leaf->row_f64[0] = f64_vals;
         recompute_aggregates(leaf);
-        root_.store(leaf, std::memory_order_release);
-        return;
+        return leaf;
     }
 
-    InsertResult res = insert_recursive(old_root, key, row_id, i64_vals, f64_vals);
-    Node* new_root = nullptr;
+    InsertResult res = insert_recursive(root, key, row_id, i64_vals, f64_vals);
     if (!res.did_split) {
-        new_root = res.left;
-    } else {
-        new_root = new Node();
-        new_root->is_leaf = false;
-        new_root->num_keys = 1;
-        new_root->keys[0] = res.split_key;
-        new_root->children[0] = res.left;
-        new_root->children[1] = res.right;
-        recompute_aggregates(new_root);
+        return res.left;
     }
 
+    Node* new_root = alloc_node();
+    new_root->is_leaf = false;
+    new_root->num_keys = 1;
+    new_root->keys[0] = res.split_key;
+    new_root->children[0] = res.left;
+    new_root->children[1] = res.right;
+    recompute_aggregates(new_root);
+    return new_root;
+}
+
+void AugmentedBTree::upsert(int64_t key,
+                            uint64_t row_id,
+                            const std::array<int64_t, MAX_AGG_COLS>& i64_vals,
+                            const std::array<double, MAX_AGG_COLS>& f64_vals) {
+    std::lock_guard<std::mutex> lk(write_mu_);
+    Node* old_root = root_.load(std::memory_order_acquire);
+    Node* new_root = upsert_into_root(old_root, key, row_id, i64_vals, f64_vals);
     root_.store(new_root, std::memory_order_release);
+    retire_root(old_root);
+}
+
+void AugmentedBTree::upsert_batch(const std::vector<BatchEntry>& entries) {
+    if (entries.empty()) return;
+
+    std::lock_guard<std::mutex> lk(write_mu_);
+    Node* old_root = root_.load(std::memory_order_acquire);
+    Node* working_root = old_root;
+
+    for (const auto& entry : entries) {
+        Node* next_root = upsert_into_root(
+            working_root, entry.key, entry.row_id, entry.i64_vals, entry.f64_vals);
+        if (working_root != old_root) {
+            release_node(working_root);
+        }
+        working_root = next_root;
+    }
+
+    root_.store(working_root, std::memory_order_release);
     retire_root(old_root);
 }
 

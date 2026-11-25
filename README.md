@@ -60,12 +60,15 @@ Measured on Windows x64 (`MSVC 19.52`, `/std:c++latest /O2 /arch:AVX2`, `zephyrd
 
 | Benchmark | Measured Result | Notes |
 | --- | --- | --- |
-| **Arena Bump Allocation** (24 B, reset/16k) | **2.35 ns/op** | 64-byte aligned slab allocator |
-| **Augmented B-Tree `O(1)` `COUNT` / `SUM`** (100k rows) | **6.28 ns/query** | Root metadata read (`ZEPHYR_FLAG_O1_FASTPATH`) |
-| **Augmented B-Tree `O(log N)` `range_sum`** (50k-key range) | **145.61 ns/query** | Subtree aggregate pruning |
-| **SIMD Columnar Filter** (`100k` `int64_t`) | **1,418.37 M rows/sec** | AVX2 4-wide 64-element bitmask chunks |
-| **Lock-Free RCU Point Reads** (4 threads) | **112.62 M reads/sec** | Zero mutexes on read path |
-| **SQL C-ABI `COUNT(*) + SUM(gold)` Roundtrip** | **3.00 µs/query** | Full SQL parse + O(1) exec + Arena pack |
+| **Arena Bump Allocation** (24 B, reset/16k) | **1.76 ns/op** | 64-byte aligned slab allocator |
+| **Augmented B-Tree `upsert_batch`** (100k rows) | **113.65 ms (0.88 M ops/s)** | NodePool + single CoW root swap |
+| **Augmented B-Tree `O(1)` `COUNT` / `SUM`** (100k rows) | **6.32 ns/query** | Root metadata read (`ZEPHYR_FLAG_O1_FASTPATH`) |
+| **Augmented B-Tree `O(log N)` `range_sum`** (50k-key range) | **121.15 ns/query** | Subtree aggregate pruning |
+| **SIMD Columnar Filter** (`100k` `int64_t`) | **2,154.38 M rows/sec** | AVX2 4-wide 64-element bitmask chunks |
+| **Lock-Free RCU Point Reads** (4 threads) | **196.39 M reads/sec** | Zero mutexes on read path |
+| **SQL C-ABI `COUNT(*) + SUM(gold)` Roundtrip** | **2.62 µs/query** | Full SQL parse + O(1) exec + Arena pack |
+| **SQL Prepared `O(1)` `COUNT(*) + SUM(gold)`** (`zephyr_stmt_query`) | **0.81 µs/query** | Cached AST (`zephyr_prepare`) + Arena pack |
+| **SQL Prepared Concurrent Reads** (4 threads) | **1.66 M queries/sec** | `std::shared_mutex` multi-reader scaling |
 
 ---
 
@@ -140,23 +143,34 @@ dotnet run -c Release --project bindings/unity/ZephyrDB.Tests
 - TypeScript linear-memory wrapper: [bindings/wasm/zephyrdb.ts](bindings/wasm/zephyrdb.ts)
 - Rust FFI crate: [bindings/rust/src/lib.rs](bindings/rust/src/lib.rs) (`cargo check --manifest-path bindings/rust/Cargo.toml`)
 
-### 5. Standalone Server (PGWire v3.0 + Raft Diplomat)
+### 5. Node.js Website Backend & Standalone Server (PGWire v3.0 + Raft)
+
+Connect from any Node.js/TypeScript backend using [bindings/node/index.mjs](bindings/node/index.mjs) (`ZephyrPgClient` with Simple & Extended Query `$1` support, plus optional N-API embedded addon) or any Postgres client (`psql -h 127.0.0.1 -p 5432 -U postgres`):
 
 ```powershell
 .\build\zephyrdb_server.exe --data-dir ./shard_1 --pgwire-port 5432 --raft-id 1 --raft-port 7001 --peers "1@127.0.0.1:7001,2@127.0.0.1:7002"
+node bindings/node/test/test_node.mjs
 ```
 
-Connect with any PostgreSQL client (`psql -h 127.0.0.1 -p 5432 -U postgres`).
+See [docs/node-backend.md](docs/node-backend.md) and [bindings/node/examples/http_leaderboard.mjs](bindings/node/examples/http_leaderboard.mjs) for a complete REST API example.
 
 ---
 
-## Architecture & Specifications
+## Documentation Site (GitHub Pages Ready)
+
+A dark-mode Docsify documentation site is ready in [docs/](docs/index.html) (publishable via **GitHub Settings → Pages → `main` / `/docs`** at `https://kelphect.github.io/ZephyrDB/`):
 
 | Document | Description |
 | --- | --- |
-| [docs/abi.md](docs/abi.md) | Zero-copy C-ABI `extern "C"` signatures, byte offsets (`x64` & `wasm32`), Arena slab packing, and Unity C# `unsafe` patterns |
-| [docs/toolchain.md](docs/toolchain.md) | C++26 compiler flags (GCC 15/16, Clang 19+, MSVC 19.52+, Emscripten), `compat/cpp26.hpp` bridge, and socket linking |
-| [docs/ast.md](docs/ast.md) | Bounded PostgreSQL syntax subset, EBNF grammar (`WITH`, `JOIN`, `RETURNING`), and `O(1)`/`O(log N)` pushdown rules |
+| [docs/getting-started.md](docs/getting-started.md) | Build instructions, C/C++26 C-ABI & Prepared Statements quickstart |
+| [docs/sql-guide.md](docs/sql-guide.md) | PostgreSQL syntax guide (`WITH`, `JOIN`, `RETURNING`, `$1` params, `O(1)` math) |
+| [docs/node-backend.md](docs/node-backend.md) | Node.js backend guide (PGWire v3 Extended Query + N-API + HTTP REST example) |
+| [docs/unity-guide.md](docs/unity-guide.md) | Zero-GC Unity C# integration with `ReadOnlySpan<byte>` |
+| [docs/wasm-guide.md](docs/wasm-guide.md) | Emscripten `-msimd128` build & Three.js / SolidJS usage |
+| [docs/performance.md](docs/performance.md) | Architecture deep dive & measured benchmarks |
+| [docs/abi.md](docs/abi.md) | Zero-copy C-ABI `extern "C"` signatures, byte offsets (`x64` & `wasm32`), Arena slab packing |
+| [docs/toolchain.md](docs/toolchain.md) | C++26 compiler flags (GCC 15/16, Clang 19+, MSVC 19.52+, Emscripten) & socket linking |
+| [docs/ast.md](docs/ast.md) | Bounded PostgreSQL syntax subset, EBNF grammar, and `O(1)`/`O(log N)` pushdown rules |
 | [AGENTS.md](AGENTS.md) | Internal C++26 Actor/Agent architecture & AI/NPC local memory store design |
 | [PLAN.md](PLAN.md) | 5-phase engineering roadmap |
 

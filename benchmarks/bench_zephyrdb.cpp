@@ -51,6 +51,22 @@ int main() {
         std::cout << "Augmented B-Tree insert 100k: " << ms << " ms (" << (ROWS / (ms / 1000.0) / 1e6) << " M ops/s)\n";
     }
 
+    // 2b. Augmented B-Tree upsert_batch 100k rows
+    {
+        zephyr::core::AugmentedBTree batch_tree(&reaper);
+        std::vector<zephyr::core::AugmentedBTree::BatchEntry> batch(ROWS);
+        for (int i = 0; i < ROWS; ++i) {
+            batch[i].key = i + 1;
+            batch[i].row_id = static_cast<uint64_t>(i + 1);
+            batch[i].i64_vals[0] = i + 1;
+        }
+        auto t0 = Clock::now();
+        batch_tree.upsert_batch(batch);
+        auto t1 = Clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::cout << "Augmented B-Tree upsert_batch 100k: " << ms << " ms (" << (ROWS / (ms / 1000.0) / 1e6) << " M ops/s)\n";
+    }
+
     {
         constexpr int PROBES = 1000000;
         uint64_t sink = 0;
@@ -142,6 +158,42 @@ int main() {
         auto t1 = Clock::now();
         double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / Q;
         std::cout << "SQL C-ABI O(1) COUNT+SUM roundtrip: " << us << " us/query (sink=" << (sink & 1) << ")\n";
+
+        // 5b. Prepared statement O(1) COUNT+SUM roundtrip
+        ZephyrStmt* stmt = zephyr_prepare(db, "SELECT COUNT(*), SUM(gold) FROM items;");
+        auto p0 = Clock::now();
+        int64_t psink = 0;
+        for (int i = 0; i < Q; ++i) {
+            ZephyrResultSet* rs = zephyr_stmt_query(stmt, nullptr, 0);
+            psink += rs->values[0].as.i64;
+            zephyr_result_free(rs);
+        }
+        auto p1 = Clock::now();
+        double pus = std::chrono::duration<double, std::micro>(p1 - p0).count() / Q;
+        std::cout << "SQL Prepared O(1) COUNT+SUM roundtrip: " << pus << " us/query (sink=" << (psink & 1) << ")\n";
+
+        // 5c. Concurrent 4-thread SQL SELECT via shared_mutex
+        std::atomic<uint64_t> sql_reads{0};
+        std::vector<std::thread> sreaders;
+        auto c0 = Clock::now();
+        for (int t = 0; t < 4; ++t) {
+            sreaders.emplace_back([&]() {
+                uint64_t local = 0;
+                for (int i = 0; i < 5000; ++i) {
+                    ZephyrResultSet* rs = zephyr_stmt_query(stmt, nullptr, 0);
+                    if (rs && rs->row_count == 1) ++local;
+                    zephyr_result_free(rs);
+                }
+                sql_reads.fetch_add(local, std::memory_order_relaxed);
+            });
+        }
+        for (auto& th : sreaders) th.join();
+        auto c1 = Clock::now();
+        double csec = std::chrono::duration<double>(c1 - c0).count();
+        std::cout << "SQL Prepared concurrent reads (4 threads): "
+                  << (sql_reads.load() / csec / 1e6) << " M queries/sec\n";
+
+        zephyr_stmt_free(stmt);
         zephyr_db_close(db);
     }
 

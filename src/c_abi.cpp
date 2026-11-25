@@ -64,6 +64,11 @@ struct ZephyrDB {
     std::unique_ptr<zephyr::net::PgWireServer> pgwire;
 };
 
+struct ZephyrStmt {
+    ZephyrDB* db;
+    std::unique_ptr<zephyr::sql::PreparedStmt> prepared;
+};
+
 extern "C" {
 
 ZephyrConfig zephyr_default_config(void) {
@@ -123,6 +128,44 @@ ZephyrResultSet* zephyr_query_params(
 
 void zephyr_result_free(ZephyrResultSet* result) {
     zephyr::sql::ZephyrEngine::free_result(result);
+}
+
+ZephyrStmt* zephyr_prepare(ZephyrDB* db, const char* sql) {
+    if (!db || !db->engine || !sql) {
+        return nullptr;
+    }
+    auto prep = db->engine->prepare(sql);
+    if (!prep) {
+        return nullptr;
+    }
+    return new ZephyrStmt{db, std::move(prep)};
+}
+
+ZephyrResultSet* zephyr_stmt_query(
+    ZephyrStmt* stmt,
+    const ZephyrValue* params,
+    uint32_t param_count
+) {
+    if (!stmt || !stmt->db || !stmt->db->engine || !stmt->prepared) {
+        return nullptr;
+    }
+    return stmt->db->engine->query_prepared(*stmt->prepared, params, param_count);
+}
+
+int32_t zephyr_stmt_exec(
+    ZephyrStmt* stmt,
+    const ZephyrValue* params,
+    uint32_t param_count,
+    uint64_t* rows_affected
+) {
+    if (!stmt || !stmt->db || !stmt->db->engine || !stmt->prepared) {
+        return ZEPHYR_ERR_INVALID_ARG;
+    }
+    return stmt->db->engine->exec_prepared(*stmt->prepared, params, param_count, rows_affected);
+}
+
+void zephyr_stmt_free(ZephyrStmt* stmt) {
+    delete stmt;
 }
 
 ZephyrAggregate zephyr_aggregate_count(ZephyrDB* db, const char* table_name) {

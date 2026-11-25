@@ -449,10 +449,88 @@ static void test_pgwire_loopback() {
 #endif
 }
 
+static void test_upsert_batch() {
+    std::cout << "Running test_upsert_batch...\n";
+    zephyr::core::RcuReaper reaper;
+    reaper.start(1);
+    zephyr::core::AugmentedBTree tree(&reaper);
+
+    std::vector<zephyr::core::AugmentedBTree::BatchEntry> batch;
+    batch.reserve(500);
+    for (int i = 1; i <= 500; ++i) {
+        zephyr::core::AugmentedBTree::BatchEntry e;
+        e.key = i;
+        e.row_id = static_cast<uint64_t>(i * 2);
+        e.i64_vals[0] = i * 10;
+        e.f64_vals[0] = static_cast<double>(i);
+        batch.push_back(e);
+    }
+    tree.upsert_batch(batch);
+    CHECK(tree.total_count() == 500);
+    CHECK(tree.total_sum_i64(0) == 10LL * 500 * 501 / 2);
+    uint64_t rid = 0;
+    CHECK(tree.find(250, rid) && rid == 500);
+    CHECK(tree.range_sum_i64(1, 10, 0) == 550);
+    reaper.stop();
+}
+
+static void test_prepared_and_concurrent_sql() {
+    std::cout << "Running test_prepared_and_concurrent_sql...\n";
+    ZephyrConfig cfg = zephyr_default_config();
+    ZephyrDB* db = zephyr_db_open(&cfg);
+    CHECK(db != nullptr);
+    CHECK(zephyr_exec(db, "CREATE TABLE scores (id BIGINT PRIMARY KEY, name TEXT, pts BIGINT);", nullptr) == ZEPHYR_OK);
+
+    ZephyrStmt* ins = zephyr_prepare(db, "INSERT INTO scores VALUES ($1, $2, $3);");
+    CHECK(ins != nullptr);
+    for (int i = 1; i <= 100; ++i) {
+        std::string pname = "P" + std::to_string(i);
+        ZephyrValue params[3]{};
+        params[0].type = ZEPHYR_TYPE_I64;
+        params[0].as.i64 = i;
+        params[1].type = ZEPHYR_TYPE_TEXT;
+        params[1].as.slice.ptr = reinterpret_cast<const uint8_t*>(pname.data());
+        params[1].as.slice.len = static_cast<uint32_t>(pname.size());
+        params[2].type = ZEPHYR_TYPE_I64;
+        params[2].as.i64 = i * 10;
+        uint64_t aff = 0;
+        CHECK(zephyr_stmt_exec(ins, params, 3, &aff) == ZEPHYR_OK && aff == 1);
+    }
+    zephyr_stmt_free(ins);
+
+    // Direct-to-Arena fast projection check + Prepared SELECT
+    ZephyrStmt* sel = zephyr_prepare(db, "SELECT id, name, pts FROM scores WHERE pts >= $1;");
+    CHECK(sel != nullptr);
+
+    std::atomic<int> err_count{0};
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 4; ++t) {
+        readers.emplace_back([&]() {
+            ZephyrValue p{};
+            p.type = ZEPHYR_TYPE_I64;
+            p.as.i64 = 900;
+            for (int iter = 0; iter < 50; ++iter) {
+                ZephyrResultSet* r = zephyr_stmt_query(sel, &p, 1);
+                if (!r || r->status != ZEPHYR_OK || r->row_count != 11) {
+                    err_count.fetch_add(1, std::memory_order_relaxed);
+                }
+                zephyr_result_free(r);
+            }
+        });
+    }
+    for (auto& th : readers) th.join();
+    CHECK(err_count.load() == 0);
+
+    zephyr_stmt_free(sel);
+    zephyr_db_close(db);
+}
+
 int main() {
     test_arena();
     test_btree_and_rcu_concurrent();
+    test_upsert_batch();
     test_sql_and_simd();
+    test_prepared_and_concurrent_sql();
     test_persistence_wal_and_mmap();
     test_raft_cluster();
     test_pgwire_loopback();

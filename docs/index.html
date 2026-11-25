@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ZephyrDB — C++26 Embedded &amp; Distributed Game Database</title>
+  <meta name="description" content="Hyper-lightweight, embeddable C++26 database engineered for zero-frame-drop game state, instant NPC memory, and MMORPG shards." />
+  <link rel="icon" type="image/png" href="https://raw.githubusercontent.com/KelpHect/ZephyrDB/main/assets/logo.png" />
+
+  <!-- Docsify Themeable Dark Base -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/docsify-themeable@0/dist/css/theme-simple-dark.css" />
+
+  <style>
+    :root {
+      --base-background-color: #0B0F19;
+      --base-color: #E2E8F0;
+      --base-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", Helvetica, Arial, sans-serif;
+      --code-font-family: "JetBrains Mono", "Fira Code", Consolas, monospace;
+
+      --theme-color: #22D3EE;
+      --accent-indigo: #6366F1;
+      --surface-card: #0F172A;
+      --border-subtle: rgba(34, 211, 238, 0.16);
+
+      --sidebar-background: #0F172A;
+      --sidebar-border-color: rgba(99, 102, 241, 0.22);
+      --sidebar-nav-link-color: #94A3B8;
+      --sidebar-nav-link-color--hover: #22D3EE;
+      --sidebar-nav-link-color--active: #22D3EE;
+      --sidebar-nav-link-border-color--active: #22D3EE;
+      --sidebar-name-color: #F8FAFC;
+
+      --heading-color: #F8FAFC;
+      --heading-h1-color: #F8FAFC;
+      --heading-h2-color: #E2E8F0;
+      --link-color: #22D3EE;
+      --link-color--hover: #67E8F9;
+
+      --code-theme-background: #0F172A;
+      --code-inline-background: #1E293B;
+      --code-inline-color: #67E8F9;
+
+      --blockquote-background: rgba(15, 23, 42, 0.85);
+      --blockquote-border-color: #6366F1;
+
+      --table-row-odd-background: rgba(15, 23, 42, 0.65);
+      --table-row-even-background: rgba(11, 15, 25, 0.85);
+      --table-cell-border-color: rgba(148, 163, 184, 0.16);
+
+      --search-input-background-color: #0B0F19;
+      --search-input-border-color: rgba(99, 102, 241, 0.35);
+      --search-input-color: #F8FAFC;
+    }
+
+    body {
+      background-color: #0B0F19;
+      color: #E2E8F0;
+    }
+
+    .sidebar {
+      background-color: #0F172A;
+      border-right: 1px solid rgba(99, 102, 241, 0.22);
+    }
+
+    .sidebar .app-name-link img {
+      width: 36px;
+      height: 36px;
+      vertical-align: middle;
+      margin-right: 8px;
+      border-radius: 6px;
+    }
+
+    .sidebar-nav > ul > li > p {
+      color: #6366F1;
+      font-size: 0.78rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-top: 1.25rem;
+    }
+
+    .markdown-section pre {
+      border: 1px solid rgba(99, 102, 241, 0.25);
+      border-radius: 8px;
+    }
+
+    .markdown-section table {
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .zephyr-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 1rem;
+      margin: 1.25rem 0;
+    }
+
+    .zephyr-card {
+      background: #0F172A;
+      border: 1px solid rgba(34, 211, 238, 0.18);
+      border-radius: 10px;
+      padding: 1rem 1.15rem;
+      transition: border-color 0.15s ease, transform 0.15s ease;
+    }
+
+    .zephyr-card:hover {
+      border-color: #22D3EE;
+      transform: translateY(-2px);
+    }
+
+    .zephyr-card h3 {
+      margin-top: 0;
+      margin-bottom: 0.4rem;
+      font-size: 1.05rem;
+      color: #22D3EE;
+    }
+
+    .zephyr-card p {
+      margin: 0;
+      font-size: 0.9rem;
+      color: #CBD5E1;
+    }
+
+    .mermaid {
+      background: #0F172A;
+      border: 1px solid rgba(99, 102, 241, 0.25);
+      border-radius: 10px;
+      padding: 1rem;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div id="app">Loading ZephyrDB Docs...</div>
+
+  <script>
+    window.$docsify = {
+      name: 'ZephyrDB',
+      logo: 'https://raw.githubusercontent.com/KelpHect/ZephyrDB/main/assets/logo.png',
+      repo: 'https://github.com/KelpHect/ZephyrDB',
+      loadSidebar: true,
+      subMaxLevel: 3,
+      auto2top: true,
+      homepage: 'index.md',
+      search: {
+        maxAge: 86400000,
+        paths: 'auto',
+        placeholder: 'Search ZephyrDB docs...',
+        noData: 'No matching results.',
+        depth: 4
+      },
+      copyCode: {
+        buttonText: 'Copy',
+        errorText: 'Error',
+        successText: 'Copied'
+      },
+      mermaidConfig: {
+        querySelector: '.mermaid'
+      }
+    };
+  </script>
+
+  <!-- Docsify Core -->
+  <script src="https://cdn.jsdelivr.net/npm/docsify@4/lib/docsify.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/docsify-themeable@0/dist/js/docsify-themeable.min.js"></script>
+
+  <!-- Plugins: Search & Copy Code -->
+  <script src="https://cdn.jsdelivr.net/npm/docsify@4/lib/plugins/search.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/docsify-copy-code@2/dist/docsify-copy-code.min.js"></script>
+
+  <!-- Mermaid Diagrams -->
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/docsify-mermaid@2.0.1/dist/docsify-mermaid.js"></script>
+  <script>
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: 'dark',
+      themeVariables: {
+        primaryColor: '#0F172A',
+        primaryTextColor: '#F8FAFC',
+        primaryBorderColor: '#22D3EE',
+        lineColor: '#6366F1',
+        secondaryColor: '#1E293B',
+        tertiaryColor: '#0B0F19'
+      }
+    });
+  </script>
+
+  <!-- Prism Syntax Highlighting -->
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1/components/prism-bash.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1/components/prism-c.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1/components/prism-cpp.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1/components/prism-sql.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1/components/prism-csharp.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1/components/prism-typescript.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1/components/prism-json.min.js"></script>
+</body>
+</html>

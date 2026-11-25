@@ -23,6 +23,7 @@ extern "C" {
 #endif
 
 typedef struct ZephyrDB ZephyrDB;
+typedef struct ZephyrStmt ZephyrStmt;
 
 typedef enum ZephyrStatus {
     ZEPHYR_OK = 0,
@@ -119,6 +120,21 @@ ZEPHYR_API ZephyrResultSet* zephyr_query_params(
     uint32_t param_count
 );
 ZEPHYR_API void zephyr_result_free(ZephyrResultSet* result);
+
+/* Prepared Statements (skip lex/parse overhead on repeated queries) */
+ZEPHYR_API ZephyrStmt* zephyr_prepare(ZephyrDB* db, const char* sql);
+ZEPHYR_API ZephyrResultSet* zephyr_stmt_query(
+    ZephyrStmt* stmt,
+    const ZephyrValue* params,
+    uint32_t param_count
+);
+ZEPHYR_API int32_t zephyr_stmt_exec(
+    ZephyrStmt* stmt,
+    const ZephyrValue* params,
+    uint32_t param_count,
+    uint64_t* rows_affected
+);
+ZEPHYR_API void zephyr_stmt_free(ZephyrStmt* stmt);
 
 /* O(1) Augmented B-Tree direct probes */
 ZEPHYR_API ZephyrAggregate zephyr_aggregate_count(ZephyrDB* db, const char* table_name);

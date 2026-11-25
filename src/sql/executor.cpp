@@ -360,12 +360,12 @@ void ZephyrEngine::free_result(ZephyrResultSet* result) {
 }
 
 void ZephyrEngine::set_wal_replicate_callback(WalReplicateCallback cb) {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::unique_lock<std::shared_mutex> lk(mu_);
     replicate_cb_ = std::move(cb);
 }
 
 void ZephyrEngine::apply_replicated_wal(uint64_t /*lsn*/, std::string_view sql) {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::unique_lock<std::shared_mutex> lk(mu_);
     in_replay_ = true;
     auto parsed = parse_sql(sql);
     if (parsed.ok()) {
@@ -397,9 +397,58 @@ ZephyrResultSet* ZephyrEngine::query(
     const ZephyrValue* params,
     uint32_t param_count
 ) {
-    std::lock_guard<std::mutex> lk(mu_);
-    last_error_.clear();
+    clear_error();
+    ParseResult parsed = parse_sql(sql);
+    if (!parsed.ok()) {
+        return make_error_result(ZEPHYR_ERR_SYNTAX, parsed.error);
+    }
+    return execute_stmts(sql, parsed.stmts, params, param_count);
+}
 
+std::unique_ptr<PreparedStmt> ZephyrEngine::prepare(std::string_view sql) {
+    clear_error();
+    ParseResult parsed = parse_sql(sql);
+    if (!parsed.ok()) {
+        set_error(parsed.error);
+        return nullptr;
+    }
+    auto ps = std::make_unique<PreparedStmt>();
+    ps->sql = std::string(sql);
+    ps->stmts = std::move(parsed.stmts);
+    return ps;
+}
+
+ZephyrResultSet* ZephyrEngine::query_prepared(
+    const PreparedStmt& stmt,
+    const ZephyrValue* params,
+    uint32_t param_count
+) {
+    clear_error();
+    return execute_stmts(stmt.sql, stmt.stmts, params, param_count);
+}
+
+int32_t ZephyrEngine::exec_prepared(
+    const PreparedStmt& stmt,
+    const ZephyrValue* params,
+    uint32_t param_count,
+    uint64_t* rows_affected
+) {
+    ZephyrResultSet* res = query_prepared(stmt, params, param_count);
+    if (!res) return ZEPHYR_ERR_INTERNAL;
+    int32_t status = static_cast<int32_t>(res->status);
+    if (rows_affected) {
+        *rows_affected = res->rows_affected;
+    }
+    free_result(res);
+    return status;
+}
+
+ZephyrResultSet* ZephyrEngine::execute_stmts(
+    std::string_view raw_sql,
+    const std::vector<Stmt>& stmts,
+    const ZephyrValue* params,
+    uint32_t param_count
+) {
     std::vector<Value> cpp_params;
     if (params && param_count > 0) {
         cpp_params.reserve(param_count);
@@ -408,22 +457,30 @@ ZephyrResultSet* ZephyrEngine::query(
         }
     }
 
-    ParseResult parsed = parse_sql(sql);
-    if (!parsed.ok()) {
-        return make_error_result(ZEPHYR_ERR_SYNTAX, parsed.error);
-    }
-    if (parsed.stmts.empty()) {
+    if (stmts.empty()) {
         return pack_result({}, {}, {}, 0, 0);
     }
 
+    if (stmts.size() == 1 &&
+        std::holds_alternative<SelectStmt>(stmts[0]) &&
+        !in_txn_.load(std::memory_order_acquire)) {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        ZephyrResultSet* res = exec_stmt(stmts[0], raw_sql, cpp_params, false);
+        if (!res) {
+            return make_error_result(ZEPHYR_ERR_INTERNAL, "null execution result");
+        }
+        return res;
+    }
+
+    std::unique_lock<std::shared_mutex> lk(mu_);
     ZephyrResultSet* last_res = nullptr;
     uint64_t total_affected = 0;
-    for (size_t i = 0; i < parsed.stmts.size(); ++i) {
+    for (size_t i = 0; i < stmts.size(); ++i) {
         if (last_res) {
             free_result(last_res);
             last_res = nullptr;
         }
-        last_res = exec_stmt(parsed.stmts[i], sql, cpp_params, parsed.stmts.size() == 1);
+        last_res = exec_stmt(stmts[i], raw_sql, cpp_params, stmts.size() == 1);
         if (!last_res) {
             return make_error_result(ZEPHYR_ERR_INTERNAL, "null execution result");
         }
@@ -432,19 +489,19 @@ ZephyrResultSet* ZephyrEngine::query(
             return last_res;
         }
     }
-    if (parsed.stmts.size() > 1 && last_res) {
+    if (stmts.size() > 1 && last_res) {
         last_res->rows_affected = total_affected;
     }
     return last_res;
 }
 
 ZephyrAggregate ZephyrEngine::aggregate_count(std::string_view table_name) {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::shared_lock<std::shared_mutex> lk(mu_);
     ZephyrAggregate agg{};
     auto it = tables_.find(to_lower(table_name));
     if (it == tables_.end()) {
         agg.status = ZEPHYR_ERR_NOT_FOUND;
-        last_error_ = "table not found: " + std::string(table_name);
+        set_error("table not found: " + std::string(table_name));
         return agg;
     }
     agg.count = static_cast<int64_t>(it->second->btree->total_count());
@@ -453,19 +510,19 @@ ZephyrAggregate ZephyrEngine::aggregate_count(std::string_view table_name) {
 }
 
 ZephyrAggregate ZephyrEngine::aggregate_sum(std::string_view table_name, std::string_view col_name) {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::shared_lock<std::shared_mutex> lk(mu_);
     ZephyrAggregate agg{};
     auto it = tables_.find(to_lower(table_name));
     if (it == tables_.end()) {
         agg.status = ZEPHYR_ERR_NOT_FOUND;
-        last_error_ = "table not found: " + std::string(table_name);
+        set_error("table not found: " + std::string(table_name));
         return agg;
     }
     const Table& tbl = *it->second;
     int col_idx = tbl.find_col(col_name);
     if (col_idx < 0) {
         agg.status = ZEPHYR_ERR_NOT_FOUND;
-        last_error_ = "column not found: " + std::string(col_name);
+        set_error("column not found: " + std::string(col_name));
         return agg;
     }
     agg.count = static_cast<int64_t>(tbl.btree->total_count());
@@ -489,7 +546,7 @@ ZephyrAggregate ZephyrEngine::aggregate_sum(std::string_view table_name, std::st
         if (cs.type == ColumnType::I64) agg.sum_f64 = static_cast<double>(agg.sum_i64);
     } else {
         agg.status = ZEPHYR_ERR_INVALID_ARG;
-        last_error_ = "SUM requires numeric column";
+        set_error("SUM requires numeric column");
         return agg;
     }
     agg.status = ZEPHYR_OK;
@@ -497,14 +554,14 @@ ZephyrAggregate ZephyrEngine::aggregate_sum(std::string_view table_name, std::st
 }
 
 int32_t ZephyrEngine::checkpoint() {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::unique_lock<std::shared_mutex> lk(mu_);
     if (snap_path_.empty()) {
         return ZEPHYR_OK;
     }
     auto blob = serialize_snapshot();
     mmap_store_.close_mmap();
     if (!mmap_store_.write_snapshot(snap_path_, blob)) {
-        last_error_ = "failed to write snapshot";
+        set_error("failed to write snapshot");
         return ZEPHYR_ERR_IO;
     }
     if (wal_.is_open()) {
@@ -514,7 +571,7 @@ int32_t ZephyrEngine::checkpoint() {
 }
 
 const char* ZephyrEngine::result_to_json(const ZephyrResultSet* result, uint32_t* out_len) {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<std::mutex> lk(err_mu_);
     last_json_ = reflection::result_set_to_json(result);
     if (out_len) {
         *out_len = static_cast<uint32_t>(last_json_.size());
@@ -526,8 +583,22 @@ const char* ZephyrEngine::result_to_json(const ZephyrResultSet* result, uint32_t
 // Result Packing & Error Helpers
 // ============================================================================
 
+void ZephyrEngine::set_error(std::string_view msg) {
+    std::lock_guard<std::mutex> lk(err_mu_);
+    last_error_.assign(msg);
+    has_error_.store(true, std::memory_order_release);
+}
+
+void ZephyrEngine::clear_error() {
+    if (has_error_.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lk(err_mu_);
+        last_error_.clear();
+        has_error_.store(false, std::memory_order_release);
+    }
+}
+
 ZephyrResultSet* ZephyrEngine::make_error_result(uint32_t status, const std::string& msg) {
-    last_error_ = msg;
+    set_error(msg);
     auto* arena = new zephyr::core::Arena(4096);
     auto* rs = arena->create<ZephyrResultSet>();
     rs->row_count = 0;
@@ -1460,6 +1531,151 @@ ZephyrResultSet* ZephyrEngine::exec_select(
                     return pack_result(fast_names, fast_types, {std::move(fast_vals)}, 0, ZEPHYR_FLAG_O1_FASTPATH);
                 }
             }
+        }
+    }
+
+    // 2.5 Direct-to-Arena Fast Projection for simple single-table SELECT
+    if (s.ctes.empty() && !outer_ctes && s.from.has_value() && s.joins.empty() &&
+        s.group_by.empty() && !s.distinct && s.order_by.empty() && !s.items.empty()) {
+        Table* base = resolve_table(s.from->table_name, nullptr);
+        if (!base) {
+            return make_error_result(ZEPHYR_ERR_NOT_FOUND, "table not found: " + s.from->table_name);
+        }
+        std::string base_qual = s.from->alias.empty() ? base->name : s.from->alias;
+        std::string base_qual_lower = to_lower(base_qual);
+
+        bool can_fast_project = true;
+        std::vector<int> proj_cols;
+        std::vector<std::string> fast_names;
+        std::vector<ColumnType> fast_types;
+
+        for (size_t i = 0; i < s.items.size(); ++i) {
+            const auto& item = s.items[i];
+            if (item.is_star) {
+                if (!item.table_qualifier.empty() && to_lower(item.table_qualifier) != base_qual_lower) {
+                    continue;
+                }
+                for (size_t c = 0; c < base->schema.size(); ++c) {
+                    proj_cols.push_back(static_cast<int>(c));
+                    fast_names.push_back(base->schema[c].name);
+                    fast_types.push_back(base->schema[c].type);
+                }
+            } else if (item.expr && std::holds_alternative<ColumnRefExpr>(item.expr->node)) {
+                const auto& cref = std::get<ColumnRefExpr>(item.expr->node);
+                int cidx = -1;
+                if (cref.table.empty() || to_lower(cref.table) == base_qual_lower) {
+                    cidx = base->find_col(cref.column);
+                }
+                proj_cols.push_back(cidx);
+                fast_names.push_back(item.alias.empty() ? cref.column : item.alias);
+                fast_types.push_back(cidx >= 0 ? base->schema[cidx].type : ColumnType::Null);
+            } else {
+                can_fast_project = false;
+                break;
+            }
+        }
+
+        if (can_fast_project) {
+            auto matched = scan_matching_rows(*base, s.where.get(), params);
+            size_t start_idx = 0;
+            if (s.offset.has_value() && *s.offset > 0) {
+                start_idx = std::min(matched.size(), static_cast<size_t>(*s.offset));
+            }
+            size_t end_idx = matched.size();
+            if (s.limit.has_value() && *s.limit >= 0) {
+                end_idx = std::min(end_idx, start_idx + static_cast<size_t>(*s.limit));
+            }
+            size_t row_count = end_idx - start_idx;
+            size_t col_count = fast_names.size();
+
+            auto* arena = new zephyr::core::Arena(static_cast<size_t>(config_.arena_slab_bytes));
+            auto* rs = arena->create<ZephyrResultSet>();
+            rs->_arena_handle = arena;
+            rs->status = ZEPHYR_OK;
+            rs->flags = 0;
+            rs->rows_affected = 0;
+            rs->col_count = col_count;
+            rs->row_count = row_count;
+
+            if (col_count > 0) {
+                auto* cols = arena->alloc_array<ZephyrColumnDesc>(col_count);
+                for (size_t c = 0; c < col_count; ++c) {
+                    cols[c].name = arena->dup_cstr(fast_names[c]);
+                    cols[c].name_len = static_cast<uint32_t>(fast_names[c].size());
+                    cols[c].type = static_cast<int32_t>(fast_types[c]);
+                }
+                rs->columns = cols;
+            } else {
+                rs->columns = nullptr;
+            }
+
+            if (row_count > 0 && col_count > 0) {
+                auto* vals = arena->alloc_array<ZephyrValue>(row_count * col_count);
+                for (size_t r_off = 0; r_off < row_count; ++r_off) {
+                    uint32_t r_idx = matched[start_idx + r_off];
+                    for (size_t c = 0; c < col_count; ++c) {
+                        ZephyrValue& zv = vals[r_off * col_count + c];
+                        int src_col = proj_cols[c];
+                        if (src_col < 0) {
+                            zv.type = ZEPHYR_TYPE_NULL;
+                            zv._pad = 0;
+                            zv.as.i64 = 0;
+                            continue;
+                        }
+                        const ColumnData& cdata = base->columns[src_col];
+                        if (cdata.nulls[r_idx]) {
+                            zv.type = ZEPHYR_TYPE_NULL;
+                            zv._pad = 0;
+                            zv.as.i64 = 0;
+                            continue;
+                        }
+                        zv._pad = 0;
+                        switch (cdata.type) {
+                            case ColumnType::I64:
+                                zv.type = ZEPHYR_TYPE_I64;
+                                zv.as.i64 = cdata.i64_data[r_idx];
+                                break;
+                            case ColumnType::F64:
+                                zv.type = ZEPHYR_TYPE_F64;
+                                zv.as.f64 = cdata.f64_data[r_idx];
+                                break;
+                            case ColumnType::Bool:
+                                zv.type = ZEPHYR_TYPE_BOOL;
+                                zv.as.boolean = cdata.bool_data[r_idx] ? 1 : 0;
+                                break;
+                            case ColumnType::Text: {
+                                const std::string& sv = cdata.str_data[r_idx];
+                                zv.type = ZEPHYR_TYPE_TEXT;
+                                zv.as.slice.len = static_cast<uint32_t>(sv.size());
+                                zv.as.slice.reserved = 0;
+                                zv.as.slice.ptr = sv.empty()
+                                    ? reinterpret_cast<const uint8_t*>("")
+                                    : arena->dup_bytes(sv.data(), sv.size());
+                                break;
+                            }
+                            case ColumnType::Bytea: {
+                                const std::string& sv = cdata.str_data[r_idx];
+                                zv.type = ZEPHYR_TYPE_BYTEA;
+                                zv.as.slice.len = static_cast<uint32_t>(sv.size());
+                                zv.as.slice.reserved = 0;
+                                zv.as.slice.ptr = sv.empty()
+                                    ? nullptr
+                                    : arena->dup_bytes(sv.data(), sv.size());
+                                break;
+                            }
+                            case ColumnType::Null:
+                                zv.type = ZEPHYR_TYPE_NULL;
+                                zv.as.i64 = 0;
+                                break;
+                        }
+                    }
+                }
+                rs->values = vals;
+            } else {
+                rs->values = nullptr;
+            }
+
+            return rs;
         }
     }
 

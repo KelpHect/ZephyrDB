@@ -99,7 +99,7 @@ int main(int argc, char** argv) {
         std::cout << "[PGWire v3.0] listening on TCP :" << pgwire.bound_port() << "\n";
     }
 
-    std::cout << "ZephyrDB server ready (data-dir=" << data_dir << "). Press Ctrl+C to stop.\n";
+    std::cout << "ZephyrDB server ready (data-dir=" << data_dir << "). Press Ctrl+C to stop." << std::endl;
     while (!g_shutdown.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }

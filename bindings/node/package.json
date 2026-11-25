@@ -1,0 +1,26 @@
+{
+  "name": "zephyrdb",
+  "version": "0.1.0",
+  "description": "Node.js PGWire v3.0 client and N-API embedded bindings for ZephyrDB",
+  "type": "module",
+  "main": "./index.mjs",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs"
+    }
+  },
+  "scripts": {
+    "test": "node test/test_node.mjs",
+    "build:napi": "node-gyp rebuild"
+  },
+  "keywords": [
+    "zephyrdb",
+    "database",
+    "pgwire",
+    "postgres",
+    "napi"
+  ],
+  "license": "MIT"
+}

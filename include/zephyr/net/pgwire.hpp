@@ -47,6 +47,7 @@ public:
     bool is_running() const noexcept { return running_.load(std::memory_order_acquire); }
 
 private:
+    bool start_impl(ZephyrDB* db, QueryHandler handler, uint16_t port, ErrorProvider err_provider);
     void accept_loop();
     void handle_client(uintptr_t client_sock);
 
@@ -55,6 +56,7 @@ private:
     std::atomic<uintptr_t> listen_sock_{static_cast<uintptr_t>(~0ULL)};
     std::atomic<int32_t> next_backend_pid_{1000};
 
+    ZephyrDB* db_{nullptr};
     QueryHandler query_handler_;
     ErrorProvider error_provider_;
 

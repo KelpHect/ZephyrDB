@@ -55,10 +55,19 @@ public:
     // Serialized CoW Write APIs
     // ------------------------------------------------------------------------
 
+    struct BatchEntry {
+        int64_t key = 0;
+        uint64_t row_id = 0;
+        std::array<int64_t, MAX_AGG_COLS> i64_vals{};
+        std::array<double, MAX_AGG_COLS> f64_vals{};
+    };
+
     void upsert(int64_t key,
                 uint64_t row_id,
                 const std::array<int64_t, MAX_AGG_COLS>& i64_vals = {},
                 const std::array<double, MAX_AGG_COLS>& f64_vals = {});
+
+    void upsert_batch(const std::vector<BatchEntry>& entries);
 
     bool erase(int64_t key);
     void clear();
@@ -95,12 +104,38 @@ private:
         bool did_split = false;
     };
 
+    struct NodePool {
+        static constexpr size_t MAX_POOLED_NODES = 4096;
+        std::mutex pool_mu_;
+        std::vector<Node*> free_list_;
+
+        NodePool();
+        ~NodePool();
+
+        NodePool(const NodePool&) = delete;
+        NodePool& operator=(const NodePool&) = delete;
+
+        Node* alloc_node();
+        void recycle_node(Node* n) noexcept;
+    };
+
+    static NodePool& node_pool() noexcept;
+    static Node* alloc_node();
+    static void recycle_node(Node* n) noexcept;
+
     static void add_ref(Node* n) noexcept;
     static void release_node(Node* n) noexcept;
     static void rcu_node_deleter(void* p);
 
     static Node* clone_node(const Node* src);
     static void recompute_aggregates(Node* n) noexcept;
+
+    static Node* upsert_into_root(
+        const Node* root,
+        int64_t key,
+        uint64_t row_id,
+        const std::array<int64_t, MAX_AGG_COLS>& i64_vals,
+        const std::array<double, MAX_AGG_COLS>& f64_vals);
 
     static InsertResult insert_recursive(
         const Node* n,

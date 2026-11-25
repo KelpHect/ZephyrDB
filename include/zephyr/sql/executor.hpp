@@ -9,10 +9,12 @@
 #include "zephyr/storage/mmap_store.hpp"
 #include "zephyr/storage/wal.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -79,6 +81,11 @@ struct Table {
     int find_col(std::string_view col_name) const;
 };
 
+struct PreparedStmt {
+    std::string sql;
+    std::vector<Stmt> stmts;
+};
+
 class ZephyrEngine {
 public:
     using WalReplicateCallback = std::function<void(uint64_t lsn, std::string_view sql)>;
@@ -94,11 +101,23 @@ public:
                            const ZephyrValue* params = nullptr,
                            uint32_t param_count = 0);
 
+    std::unique_ptr<PreparedStmt> prepare(std::string_view sql);
+    ZephyrResultSet* query_prepared(const PreparedStmt& stmt,
+                                    const ZephyrValue* params = nullptr,
+                                    uint32_t param_count = 0);
+    int32_t exec_prepared(const PreparedStmt& stmt,
+                          const ZephyrValue* params = nullptr,
+                          uint32_t param_count = 0,
+                          uint64_t* rows_affected = nullptr);
+
     ZephyrAggregate aggregate_count(std::string_view table_name);
     ZephyrAggregate aggregate_sum(std::string_view table_name, std::string_view col_name);
 
     int32_t checkpoint();
-    const char* last_error() const noexcept { return last_error_.c_str(); }
+    const char* last_error() const noexcept {
+        std::lock_guard<std::mutex> lk(err_mu_);
+        return last_error_.c_str();
+    }
     const char* result_to_json(const ZephyrResultSet* result, uint32_t* out_len);
 
     ZephyrResultSet* execute_sql_for_wire(std::string_view sql) { return query(sql); }
@@ -116,6 +135,15 @@ private:
         const std::vector<Value>* params{nullptr};
     };
 
+    ZephyrResultSet* execute_stmts(
+        std::string_view raw_sql,
+        const std::vector<Stmt>& stmts,
+        const ZephyrValue* params,
+        uint32_t param_count
+    );
+
+    void set_error(std::string_view msg);
+    void clear_error();
     ZephyrResultSet* make_error_result(uint32_t status, const std::string& msg);
     ZephyrResultSet* pack_result(
         const std::vector<std::string>& col_names,
@@ -169,7 +197,8 @@ private:
     std::string snap_path_;
     std::string wal_path_;
 
-    mutable std::mutex mu_;
+    mutable std::shared_mutex mu_;
+    mutable std::mutex err_mu_;
     zephyr::core::RcuReaper reaper_;
     zephyr::storage::WalManager wal_;
     zephyr::storage::MmapStore mmap_store_;
@@ -177,12 +206,13 @@ private:
 
     std::unordered_map<std::string, std::unique_ptr<Table>> tables_;
 
-    bool in_txn_{false};
+    std::atomic<bool> in_txn_{false};
     bool in_replay_{false};
     std::unordered_map<std::string, std::unique_ptr<Table>> txn_backup_;
     std::vector<std::string> txn_wal_buffer_;
 
     WalReplicateCallback replicate_cb_;
+    std::atomic<bool> has_error_{false};
     std::string last_error_;
     std::string last_json_;
 };
