@@ -76,12 +76,12 @@ struct Table {
     bool pk_is_i64{false};
     uint64_t next_row_id{1};
 
-    std::unordered_map<int64_t, size_t> pk_i64_index;
+    static constexpr size_t WRITE_SHARDS = 8;
+    std::array<std::unordered_map<int64_t, size_t>, WRITE_SHARDS> pk_shard_index;
     std::unordered_map<std::string, size_t> pk_str_index;
     std::unique_ptr<zephyr::core::ShardedAugmentedBTree> btree;
     mutable std::mutex write_mu;
     mutable std::shared_mutex rw_mu;
-    static constexpr size_t WRITE_SHARDS = 8;
     mutable std::array<std::mutex, WRITE_SHARDS> row_shard_mu;
 
     std::unique_ptr<Table> clone_data(zephyr::core::RcuReaper* reaper) const;
@@ -127,10 +127,24 @@ struct CompiledPkInsertPlan {
     std::vector<Slot> values;
 };
 
+struct CompiledPkSelectPlan {
+    struct ColItem {
+        std::string col_lower;
+        std::string label;
+    };
+    std::string table_lower;
+    std::string pk_col_lower;
+    bool select_star{false};
+    std::vector<ColItem> items;
+    uint32_t pk_param_idx{0}; // 1-based if > 0; 0 means pk_literal is used
+    int64_t pk_literal{0};
+};
+
 struct PreparedStmt {
     std::string sql;
     std::vector<Stmt> stmts;
     std::optional<CompiledO1Plan> o1_plan;
+    std::optional<CompiledPkSelectPlan> pk_select_plan;
     std::optional<CompiledPkUpdatePlan> pk_update_plan;
     std::optional<CompiledPkInsertPlan> pk_insert_plan;
 };
@@ -153,7 +167,8 @@ struct TransparentStringEq {
 };
 
 struct StmtCacheSnapshot {
-    std::unordered_map<std::string, std::shared_ptr<PreparedStmt>,
+    std::vector<std::shared_ptr<PreparedStmt>> owners;
+    std::unordered_map<std::string_view, const PreparedStmt*,
                        TransparentStringHash, TransparentStringEq> entries;
 };
 
@@ -162,10 +177,13 @@ public:
     using WalReplicateCallback = std::function<void(uint64_t lsn, std::string_view sql)>;
 
     explicit ZephyrEngine(const ZephyrConfig& cfg);
+    ZephyrEngine(const ZephyrConfig& cfg, const uint8_t* enc_key, uint32_t enc_key_len);
     ~ZephyrEngine();
 
     ZephyrEngine(const ZephyrEngine&) = delete;
     ZephyrEngine& operator=(const ZephyrEngine&) = delete;
+
+    bool auth_ok() const noexcept { return auth_ok_; }
 
     int32_t execute(std::string_view sql, uint64_t* rows_affected = nullptr);
     int32_t execute_sync(std::string_view sql, uint64_t* rows_affected = nullptr);
@@ -216,12 +234,25 @@ private:
         bool sync_wal = false
     );
 
+    ZephyrResultSet* query_prepared_impl(
+        const PreparedStmt& stmt,
+        const ZephyrValue* params,
+        uint32_t param_count,
+        bool rcu_held
+    );
+    ZephyrResultSet* try_exec_pk_select_plan(
+        const PreparedStmt& stmt,
+        const ZephyrValue* params,
+        uint32_t param_count,
+        bool rcu_held
+    );
     bool try_exec_pk_update_plan(
         const PreparedStmt& stmt,
         const ZephyrValue* params,
         uint32_t param_count,
         int32_t& out_status,
-        uint64_t& out_affected
+        uint64_t& out_affected,
+        bool rcu_held = false
     );
     bool try_exec_pk_insert_plan(
         const PreparedStmt& stmt,
@@ -282,12 +313,17 @@ private:
 
     void log_wal_entry(std::string_view sql, bool sync_wait = false);
     bool load_snapshot(const std::string& snap_path);
+    bool parse_snapshot_blob(const uint8_t* p, size_t len);
     std::vector<uint8_t> serialize_snapshot() const;
 
     ZephyrConfig config_{};
     std::string data_dir_;
     std::string snap_path_;
     std::string wal_path_;
+    bool encrypted_{false};
+    bool auth_ok_{true};
+    uint8_t wal_key_[32]{};
+    uint8_t snap_key_[32]{};
 
     mutable std::shared_mutex mu_;
     mutable std::mutex err_mu_;

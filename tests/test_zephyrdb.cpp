@@ -9,6 +9,7 @@
 #include "zephyr/sql/executor.hpp"
 #include "zephyr/sql/reflection.hpp"
 #include "zephyr/sql/simd_eval.hpp"
+#include "zephyr/storage/crypto.hpp"
 #include "zephyr/storage/mmap_store.hpp"
 #include "zephyr/storage/wal.hpp"
 
@@ -716,15 +717,115 @@ static void test_same_table_sharded_pk_updates() {
     zephyr_db_close(db);
 }
 
+static void test_pk_select_fastpath() {
+    std::cout << "Running test_pk_select_fastpath...\n";
+    ZephyrConfig cfg = zephyr_default_config();
+    ZephyrDB* db = zephyr_db_open(&cfg);
+    CHECK(db != nullptr);
+    CHECK(zephyr_exec(db, "CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT, gold BIGINT);", nullptr) == ZEPHYR_OK);
+    CHECK(zephyr_exec(db, "INSERT INTO users VALUES (10, 'Alice', 500), (20, 'Bob', 900);", nullptr) == ZEPHYR_OK);
+
+    ZephyrStmt* sel = zephyr_prepare(db, "SELECT id, name, gold FROM users WHERE id = $1;");
+    CHECK(sel != nullptr);
+    ZephyrValue p{};
+    p.type = ZEPHYR_TYPE_I64; p.as.i64 = 20;
+    ZephyrResultSet* r = zephyr_stmt_query(sel, &p, 1);
+    CHECK(r != nullptr && r->status == ZEPHYR_OK && r->row_count == 1 && r->col_count == 3);
+    CHECK(r->values[0].as.i64 == 20);
+    CHECK(std::strcmp(reinterpret_cast<const char*>(r->values[1].as.slice.ptr), "Bob") == 0);
+    CHECK(r->values[2].as.i64 == 900);
+    zephyr_result_free(r);
+    zephyr_stmt_free(sel);
+
+    ZephyrResultSet* r2 = zephyr_query(db, "SELECT * FROM users WHERE id = 10;");
+    CHECK(r2 != nullptr && r2->status == ZEPHYR_OK && r2->row_count == 1 && r2->values[2].as.i64 == 500);
+    zephyr_result_free(r2);
+    zephyr_db_close(db);
+}
+
+static void test_crypto_and_encrypted_db() {
+    std::cout << "Running test_crypto_and_encrypted_db...\n";
+    CHECK(zephyr::storage::crypto::self_test());
+
+    fs::path dir = fs::temp_directory_path() / "zephyrdb_test_aead";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    std::string dir_str = dir.string();
+
+    const char* key = "super-secret-game-key-32bytes!!";
+    const uint32_t key_len = static_cast<uint32_t>(std::strlen(key));
+    const char* bad_key = "wrong-secret-key-32bytes!!!!!!!";
+    const uint32_t bad_len = static_cast<uint32_t>(std::strlen(bad_key));
+
+    ZephyrConfig cfg = zephyr_default_config();
+    cfg.data_dir = dir_str.c_str();
+    cfg.wal_flush_ms = 1;
+    cfg.enable_wal = 1;
+    cfg.enable_compactor = 0;
+
+    {
+        ZephyrDB* db = zephyr_db_open_encrypted(&cfg, reinterpret_cast<const uint8_t*>(key), key_len);
+        CHECK(db != nullptr);
+        CHECK(zephyr_exec_sync(db, "CREATE TABLE accounts (id BIGINT PRIMARY KEY, email TEXT, balance BIGINT);", nullptr) == ZEPHYR_OK);
+        CHECK(zephyr_exec_sync(db, "INSERT INTO accounts VALUES (1, 'aria@guild.gg', 1200);", nullptr) == ZEPHYR_OK);
+        zephyr_db_close(db);
+    }
+
+    // Wrong key must be rejected
+    {
+        ZephyrDB* bad = zephyr_db_open_encrypted(&cfg, reinterpret_cast<const uint8_t*>(bad_key), bad_len);
+        CHECK(bad == nullptr);
+    }
+
+    // Correct key replays encrypted WAL and checkpoints encrypted snapshot
+    {
+        ZephyrDB* db = zephyr_db_open_encrypted(&cfg, reinterpret_cast<const uint8_t*>(key), key_len);
+        CHECK(db != nullptr);
+        CHECK(zephyr_aggregate_count(db, "accounts").count == 1);
+        CHECK(zephyr_aggregate_sum(db, "accounts", "balance").sum_i64 == 1200);
+        CHECK(zephyr_checkpoint(db) == ZEPHYR_OK);
+        CHECK(zephyr_exec_sync(db, "INSERT INTO accounts VALUES (2, 'bram@guild.gg', 800);", nullptr) == ZEPHYR_OK);
+        zephyr_db_close(db);
+    }
+
+    // Reopen encrypted snapshot + trailing encrypted WAL
+    {
+        ZephyrDB* db = zephyr_db_open_encrypted(&cfg, reinterpret_cast<const uint8_t*>(key), key_len);
+        CHECK(db != nullptr);
+        CHECK(zephyr_aggregate_count(db, "accounts").count == 2);
+        CHECK(zephyr_aggregate_sum(db, "accounts", "balance").sum_i64 == 2000);
+        zephyr_db_close(db);
+    }
+
+    // Tampering encrypted snapshot must be detected and rejected
+    fs::path snap_file = dir / "zephyr.zdb";
+    if (fs::exists(snap_file)) {
+        FILE* f = std::fopen(snap_file.string().c_str(), "r+b");
+        if (f) {
+            std::fseek(f, -5, SEEK_END);
+            int ch = std::fgetc(f);
+            std::fseek(f, -1, SEEK_CUR);
+            std::fputc(ch ^ 0xFF, f);
+            std::fclose(f);
+        }
+        ZephyrDB* tampered = zephyr_db_open_encrypted(&cfg, reinterpret_cast<const uint8_t*>(key), key_len);
+        CHECK(tampered == nullptr);
+    }
+
+    fs::remove_all(dir);
+}
+
 int main() {
     test_arena();
     test_btree_and_rcu_concurrent();
     test_upsert_batch();
     test_sql_and_simd();
+    test_pk_select_fastpath();
     test_prepared_and_concurrent_sql();
     test_concurrent_writes_pk_update_and_sys_tables();
     test_same_table_sharded_pk_updates();
     test_persistence_wal_and_mmap();
+    test_crypto_and_encrypted_db();
     test_raft_cluster();
     test_pgwire_loopback();
     test_studio_http_loopback();

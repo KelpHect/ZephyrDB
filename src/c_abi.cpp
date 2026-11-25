@@ -97,6 +97,24 @@ ZephyrDB* zephyr_db_open(const ZephyrConfig* config) {
     ZephyrConfig cfg = config ? *config : zephyr_default_config();
     auto* db = new ZephyrDB();
     db->engine = std::make_unique<zephyr::sql::ZephyrEngine>(cfg);
+    if (!db->engine->auth_ok()) {
+        delete db;
+        return nullptr;
+    }
+    return db;
+}
+
+ZephyrDB* zephyr_db_open_encrypted(const ZephyrConfig* config, const uint8_t* key, uint32_t key_len) {
+    if (!key || key_len == 0) {
+        return nullptr;
+    }
+    ZephyrConfig cfg = config ? *config : zephyr_default_config();
+    auto* db = new ZephyrDB();
+    db->engine = std::make_unique<zephyr::sql::ZephyrEngine>(cfg, key, key_len);
+    if (!db->engine->auth_ok()) {
+        delete db;
+        return nullptr;
+    }
     return db;
 }
 

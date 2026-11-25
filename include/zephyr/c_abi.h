@@ -33,7 +33,8 @@ typedef enum ZephyrStatus {
     ZEPHYR_ERR_CONSTRAINT = 4,
     ZEPHYR_ERR_IO = 5,
     ZEPHYR_ERR_INTERNAL = 6,
-    ZEPHYR_ERR_BUSY = 7
+    ZEPHYR_ERR_BUSY = 7,
+    ZEPHYR_ERR_AUTH = 8
 } ZephyrStatus;
 
 typedef enum ZephyrType {
@@ -121,6 +122,7 @@ typedef struct ZephyrStats {
 
 ZEPHYR_API ZephyrConfig zephyr_default_config(void);
 ZEPHYR_API ZephyrDB* zephyr_db_open(const ZephyrConfig* config);
+ZEPHYR_API ZephyrDB* zephyr_db_open_encrypted(const ZephyrConfig* config, const uint8_t* key, uint32_t key_len);
 ZEPHYR_API void zephyr_db_close(ZephyrDB* db);
 
 ZEPHYR_API int32_t zephyr_exec(ZephyrDB* db, const char* sql, uint64_t* rows_affected);

@@ -60,17 +60,18 @@ Measured on Windows x64 (`MSVC 19.52`, `/std:c++latest /O2 /arch:AVX2`, `zephyrd
 
 | Benchmark | Measured Result | Notes |
 | --- | --- | --- |
-| **Arena Bump Allocation** (24 B, reset/16k) | **1.89 ns/op** | 64-byte aligned slab allocator |
-| **Augmented B-Tree `upsert_batch`** (100k rows) | **4.75 ms (21.07 M ops/s)** | Compact split nodes + O(N) bulk-load |
-| **Augmented B-Tree `O(1)` `COUNT` / `SUM`** (100k rows) | **3.30 ns/query** | Asymmetric RCU + root metadata (`ZEPHYR_FLAG_O1_FASTPATH`) |
-| **Augmented B-Tree `O(log N)` `range_sum`** (50k-key range) | **180.79 ns/query** | Branchless search + subtree aggregate pruning |
-| **SIMD Columnar Filter** (`100k` `int64_t`) | **3,468.84 M rows/sec** | 16-wide unrolled AVX2 + template-hoisted `CmpOp` |
-| **Lock-Free RCU Point Reads** (4 threads) | **100.38 M reads/sec** | Asymmetric RCU (`FlushProcessWriteBuffers`) |
-| **SQL C-ABI `COUNT(*) + SUM(gold)` Roundtrip** | **0.19 µs/query** | Lock-free RCU `StmtCacheSnapshot` + O(1) exec |
-| **SQL Prepared `O(1)` `COUNT(*) + SUM(gold)`** (`zephyr_stmt_query`) | **0.17 µs/query** | Lock-free `CatalogSnapshot` + precompiled plan + pooled Arena |
-| **SQL Prepared Concurrent Reads** (4 threads) | **16.87 M queries/sec** | Sharded `alignas(64)` telemetry counters |
-| **Same-Table Sharded PK Updates** (4 threads) | **0.97 M updates/sec** | 8-way `row_shard_mu` + `ShardedAugmentedBTree` |
-| **Mixed MMORPG `2R + 2W` Workload** | **10.89 M ops/sec** | Lock-free reads + parallel per-table writes |
+| **Arena Bump Allocation** (24 B, reset/16k) | **1.99 ns/op** | 64-byte aligned slab allocator |
+| **Augmented B-Tree `upsert_batch_columnar`** (100k rows) | **0.86 ms (115.75 M ops/s)** | **Sub-millisecond** columnar O(N) bulk-load |
+| **Augmented B-Tree `O(1)` `COUNT` / `SUM`** (100k rows) | **2.09 ns/query** | Single-guard multi-shard asymmetric RCU |
+| **SIMD Columnar Filter** (`100k` `int64_t`) | **6,098.49 M rows/sec** | 16-wide unrolled AVX2 + template-hoisted `CmpOp` |
+| **Lock-Free RCU Point Reads** (4 threads) | **179.51 M reads/sec** | Asymmetric RCU (`FlushProcessWriteBuffers`) |
+| **SQL Prepared `O(1)` `COUNT(*) + SUM(gold)`** (`zephyr_stmt_query`) | **0.08 µs/query** (`80 ns`) | Lock-free `CatalogSnapshot` + precompiled plan + pooled Arena |
+| **SQL Prepared Concurrent Reads** (4 threads) | **20.41 M queries/sec** | Sharded `alignas(64)` telemetry counters |
+| **SQL Precompiled PK Point-Update** | **0.33 µs/op (3.07 M updates/sec)** | Zero-clone in-place leaf delta |
+| **Same-Table Sharded PK Updates** (4 threads) | **8.83 M updates/sec** | 8-way `row_shard_mu` + `pk_shard_index` |
+| **Mixed MMORPG `2R + 2W` Workload** | **27.43 M ops/sec** | Lock-free reads + parallel per-table writes |
+| **Everyday SQL: 1 PK `SELECT` / 50 PK `SELECT`s** (10k rows) | **0.08 µs** / **4.10 µs** | O(1) `CompiledPkSelectPlan` fastpath |
+| **Everyday SQL: 1 `INSERT` / 50 `INSERT`s** | **13.50 µs** / **62.70 µs** | Prepared `INSERT` |
 
 ---
 
@@ -169,6 +170,8 @@ A dark-mode Docsify documentation site is ready in [docs/](docs/index.html) (pub
 | [docs/node-backend.md](docs/node-backend.md) | Node.js backend guide (PGWire v3 Extended Query + N-API + HTTP REST example) |
 | [docs/unity-guide.md](docs/unity-guide.md) | Zero-GC Unity C# integration with `ReadOnlySpan<byte>` |
 | [docs/wasm-guide.md](docs/wasm-guide.md) | Emscripten `-msimd128` build & Three.js / SolidJS usage |
+| [docs/studio.md](docs/studio.md) | Built-in dark-mode Zephyr Studio web inspector (`--studio-port`) |
+| [docs/security.md](docs/security.md) | ChaCha20-Poly1305 AEAD encryption at rest, HKDF, and strict sync WAL |
 | [docs/performance.md](docs/performance.md) | Architecture deep dive & measured benchmarks |
 | [docs/abi.md](docs/abi.md) | Zero-copy C-ABI `extern "C"` signatures, byte offsets (`x64` & `wasm32`), Arena slab packing |
 | [docs/toolchain.md](docs/toolchain.md) | C++26 compiler flags (GCC 15/16, Clang 19+, MSVC 19.52+, Emscripten) & socket linking |

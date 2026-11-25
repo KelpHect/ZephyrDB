@@ -12,6 +12,7 @@ set(ZEPHYR_CORE_SOURCES
     src/core/arena.cpp
     src/core/rcu.cpp
     src/core/augmented_btree.cpp
+    src/storage/crypto.cpp
     src/storage/wal.cpp
     src/storage/mmap_store.cpp
     src/sql/lexer.cpp

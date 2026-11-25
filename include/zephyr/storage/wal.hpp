@@ -52,13 +52,19 @@ private:
 /// asynchronously to the physical WAL file on a background execution context.
 class WalManager {
 public:
-    static constexpr uint32_t MAGIC = 0x5A57414Cu; // "ZWAL"
+    static constexpr uint32_t MAGIC = 0x5A57414Cu;           // "ZWAL"
+    static constexpr uint32_t MAGIC_ENCRYPTED = 0x5A574145u; // "ZWAE"
 
     WalManager() = default;
     ~WalManager();
 
     WalManager(const WalManager&) = delete;
     WalManager& operator=(const WalManager&) = delete;
+
+    /// Enable (or disable when key32 == nullptr || len == 0) WAL record encryption.
+    /// Stores/derives a 32-byte AEAD key and generates a random 4-byte nonce salt.
+    void set_encryption_key(const uint8_t* key32, size_t len);
+    bool is_encrypted() const noexcept { return encrypted_; }
 
     bool open(const std::string& wal_path, uint32_t flush_ms = 2);
     void close();
@@ -75,8 +81,9 @@ public:
     /// Force-flush all queued records to disk and wait for completion.
     void flush();
 
-    /// Replay all valid, CRC-verified records from the WAL file on disk.
-    std::vector<WalRecord> replay() const;
+    /// Replay all valid, CRC- or AEAD-verified records from the WAL file on disk.
+    /// If `auth_failed` is non-null, sets `*auth_failed = true` on encryption/auth mismatch.
+    std::vector<WalRecord> replay(bool* auth_failed = nullptr) const;
 
     /// Truncate WAL records up to `up_to_lsn` (UINT64_MAX truncates the entire file).
     void truncate(uint64_t up_to_lsn = UINT64_MAX);
@@ -109,6 +116,10 @@ private:
     std::atomic<uint64_t> next_lsn_{1};
     std::atomic<uint64_t> flushed_lsn_{0};
     std::atomic<uint64_t> synced_lsn_{0};
+
+    bool encrypted_{false};
+    std::array<uint8_t, 32> enc_key_{};
+    std::array<uint8_t, 4> nonce_salt_{};
 };
 
 } // namespace zephyr::storage

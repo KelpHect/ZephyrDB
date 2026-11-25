@@ -72,6 +72,7 @@ struct retired_node {
 class rcu_domain {
 public:
     static constexpr size_t MAX_READER_SLOTS = 256;
+    static constexpr size_t LOCAL_RETIRE_BATCH = 64;
 
     struct alignas(64) reader_slot {
         std::atomic<bool> in_use{false};
@@ -146,12 +147,20 @@ public:
 
     void retire(void* ptr, void (*deleter)(void*)) {
         if (!ptr || !deleter) return;
-        uint64_t e = global_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
-        std::lock_guard<std::mutex> lk(retire_mu_);
-        retired_.push_back(retired_node{ptr, deleter, e});
+        auto& batch = tls_retire_cache().get_or_create(this);
+        batch.nodes[batch.count++] = retired_node{ptr, deleter, 0};
+        if (batch.count >= LOCAL_RETIRE_BATCH) {
+            flush_nodes(batch.nodes.data(), batch.count);
+            batch.count = 0;
+        }
+    }
+
+    void flush_local() {
+        tls_retire_cache().flush_domain(this, false);
     }
 
     size_t poll_reclaim() {
+        flush_local();
         {
             std::lock_guard<std::mutex> lk(retire_mu_);
             if (retired_.empty()) return 0;
@@ -178,6 +187,7 @@ public:
     }
 
     void synchronize() {
+        flush_local();
         uint64_t target = global_epoch_.fetch_add(1, std::memory_order_seq_cst) + 1;
         while (min_active_epoch() <= target) {
             std::this_thread::yield();
@@ -186,11 +196,13 @@ public:
     }
 
     size_t pending_count() const {
+        const size_t local = tls_retire_cache().count_for(this);
         std::lock_guard<std::mutex> lk(retire_mu_);
-        return retired_.size();
+        return retired_.size() + local;
     }
 
     void drain_all() {
+        tls_retire_cache().flush_domain(this, true);
         std::vector<retired_node> all;
         {
             std::lock_guard<std::mutex> lk(retire_mu_);
@@ -202,6 +214,100 @@ public:
     }
 
 private:
+    struct local_batch {
+        rcu_domain* dom = nullptr;
+        std::array<retired_node, LOCAL_RETIRE_BATCH> nodes{};
+        size_t count = 0;
+    };
+
+    struct local_retire_cache {
+        local_batch primary{};
+        std::vector<local_batch> overflow;
+
+        ~local_retire_cache() {
+            if (primary.dom && primary.count > 0) {
+                primary.dom->flush_nodes(primary.nodes.data(), primary.count);
+                primary.count = 0;
+            }
+            for (auto& b : overflow) {
+                if (b.dom && b.count > 0) {
+                    b.dom->flush_nodes(b.nodes.data(), b.count);
+                    b.count = 0;
+                }
+            }
+            overflow.clear();
+        }
+
+        local_batch& get_or_create(rcu_domain* dom) {
+            if (primary.dom == dom) [[likely]] {
+                return primary;
+            }
+            if (primary.dom == nullptr) {
+                primary.dom = dom;
+                primary.count = 0;
+                return primary;
+            }
+            for (auto& b : overflow) {
+                if (b.dom == dom) return b;
+            }
+            overflow.push_back(local_batch{dom, {}, 0});
+            return overflow.back();
+        }
+
+        void flush_domain(rcu_domain* dom, bool erase_entry) {
+            if (primary.dom == dom) {
+                if (primary.count > 0) {
+                    dom->flush_nodes(primary.nodes.data(), primary.count);
+                    primary.count = 0;
+                }
+                if (erase_entry) {
+                    if (!overflow.empty()) {
+                        primary = overflow.back();
+                        overflow.pop_back();
+                    } else {
+                        primary.dom = nullptr;
+                    }
+                }
+                return;
+            }
+            for (size_t i = 0; i < overflow.size(); ++i) {
+                if (overflow[i].dom == dom) {
+                    if (overflow[i].count > 0) {
+                        dom->flush_nodes(overflow[i].nodes.data(), overflow[i].count);
+                        overflow[i].count = 0;
+                    }
+                    if (erase_entry) {
+                        overflow.erase(overflow.begin() + static_cast<std::ptrdiff_t>(i));
+                    }
+                    return;
+                }
+            }
+        }
+
+        size_t count_for(const rcu_domain* dom) const noexcept {
+            if (primary.dom == dom) return primary.count;
+            for (const auto& b : overflow) {
+                if (b.dom == dom) return b.count;
+            }
+            return 0;
+        }
+    };
+
+    static local_retire_cache& tls_retire_cache() {
+        static thread_local local_retire_cache cache;
+        return cache;
+    }
+
+    void flush_nodes(retired_node* nodes, size_t count) {
+        if (count == 0) return;
+        const uint64_t e = global_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        for (size_t i = 0; i < count; ++i) {
+            nodes[i].retire_epoch = e;
+        }
+        std::lock_guard<std::mutex> lk(retire_mu_);
+        retired_.insert(retired_.end(), nodes, nodes + count);
+    }
+
     uint64_t min_active_epoch() const noexcept {
 #if defined(_WIN32)
         // Issue a process-wide memory barrier (IPI) so all relaxed reader

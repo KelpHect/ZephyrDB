@@ -70,10 +70,19 @@ public:
 
     void upsert_batch(const std::vector<BatchEntry>& entries);
 
+    void upsert_batch_columnar(const int64_t* keys,
+                               const uint64_t* row_ids,
+                               const int64_t* col0_i64,
+                               size_t count);
+
+    bool update_existing_i64(int64_t key, size_t col, int64_t delta_i64);
+    bool update_existing_f64(int64_t key, size_t col, double delta_f64);
+
     bool erase(int64_t key);
     void clear();
 
 private:
+    friend class ShardedAugmentedBTree;
     static constexpr size_t INLINE_AGG_COLS = 2;
     static constexpr size_t EXTRA_AGG_COLS = MAX_AGG_COLS - INLINE_AGG_COLS;
 
@@ -172,6 +181,8 @@ private:
 
     struct InternalPool {
         static constexpr size_t MAX_POOLED_NODES = 4096;
+        static constexpr size_t LOCAL_CACHE_CAP = 128;
+        struct LocalCache;
         std::mutex pool_mu_;
         std::vector<InternalNode*> free_list_;
 
@@ -183,10 +194,14 @@ private:
 
         InternalNode* alloc_internal();
         void recycle_internal(InternalNode* n) noexcept;
+        size_t alloc_batch(InternalNode** out, size_t max_count) noexcept;
+        void recycle_batch(InternalNode** nodes, size_t count) noexcept;
     };
 
     struct LeafPool {
         static constexpr size_t MAX_POOLED_NODES = 4096;
+        static constexpr size_t LOCAL_CACHE_CAP = 128;
+        struct LocalCache;
         std::mutex pool_mu_;
         std::vector<LeafNode*> free_list_;
 
@@ -198,6 +213,8 @@ private:
 
         LeafNode* alloc_leaf();
         void recycle_leaf(LeafNode* n) noexcept;
+        size_t alloc_batch(LeafNode** out, size_t max_count) noexcept;
+        void recycle_batch(LeafNode** nodes, size_t count) noexcept;
     };
 
     static InternalPool& internal_pool() noexcept;
@@ -214,7 +231,12 @@ private:
     static NodeHeader* clone_node(const NodeHeader* src, uint64_t batch_gen = 0);
     static void recompute_aggregates(NodeHeader* n) noexcept;
 
+    static NodeHeader* build_internal_levels_bottom_up(std::vector<NodeHeader*>& level);
     static NodeHeader* bulk_load_empty(const std::vector<BatchEntry>& entries);
+    static NodeHeader* bulk_load_empty_columnar(const int64_t* keys,
+                                                const uint64_t* row_ids,
+                                                const int64_t* col0_i64,
+                                                size_t count);
 
     static NodeHeader* upsert_into_root(
         NodeHeader* root,
@@ -299,11 +321,20 @@ public:
 
     void upsert_batch(const std::vector<BatchEntry>& entries);
 
+    void upsert_batch_columnar(const int64_t* keys,
+                               const uint64_t* row_ids,
+                               const int64_t* col0_i64,
+                               size_t count);
+
+    bool update_existing_i64(int64_t key, size_t col, int64_t delta_i64);
+    bool update_existing_f64(int64_t key, size_t col, double delta_f64);
+
     bool erase(int64_t key);
     void clear();
 
 private:
     std::array<std::unique_ptr<AugmentedBTree>, NUM_SHARDS> shards_;
+    cpp26::rcu::rcu_domain& domain_;
 };
 
 } // namespace zephyr::core

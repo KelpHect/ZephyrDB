@@ -1,4 +1,5 @@
 #include "zephyr/storage/wal.hpp"
+#include "zephyr/storage/crypto.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -76,6 +77,39 @@ void serialize_record(std::vector<uint8_t>& out, uint64_t lsn, uint8_t op, std::
     write_u32_le(out, crc);
 }
 
+void serialize_record_encrypted(std::vector<uint8_t>& out, uint64_t lsn, uint8_t op,
+                                std::string_view payload,
+                                const uint8_t key[32], const uint8_t salt[4]) {
+    const uint32_t len = static_cast<uint32_t>(payload.size());
+    const size_t rec_start = out.size();
+
+    // Format: [magic:4][salt:4][lsn:8][op:1][len:4][ct:len][tag:16]
+    write_u32_le(out, WalManager::MAGIC_ENCRYPTED);
+    out.insert(out.end(), salt, salt + 4);
+    write_u64_le(out, lsn);
+    out.push_back(op);
+    write_u32_le(out, len);
+
+    // nonce = salt(4) || lsn(8)
+    uint8_t nonce[12];
+    std::memcpy(nonce, out.data() + rec_start + 4, 4);
+    std::memcpy(nonce + 4, out.data() + rec_start + 8, 8);
+
+    // aad = magic(4) || lsn(8) || op(1) || len(4)
+    uint8_t aad[17];
+    std::memcpy(aad, out.data() + rec_start, 4);
+    std::memcpy(aad + 4, out.data() + rec_start + 8, 13);
+
+    const size_t ct_offset = out.size();
+    out.resize(ct_offset + len + 16);
+
+    const uint8_t* pt = (len > 0) ? reinterpret_cast<const uint8_t*>(payload.data()) : nullptr;
+    uint8_t* ct_out = (len > 0) ? (out.data() + ct_offset) : nullptr;
+    uint8_t* tag_out = out.data() + ct_offset + len;
+
+    crypto::aead_encrypt(key, nonce, aad, sizeof(aad), pt, len, ct_out, tag_out);
+}
+
 void os_flush_file(std::FILE* fp) noexcept {
     if (!fp) {
         return;
@@ -144,6 +178,24 @@ bool WalRingBuffer::empty() const noexcept {
 
 WalManager::~WalManager() {
     close();
+}
+
+void WalManager::set_encryption_key(const uint8_t* key32, size_t len) {
+    std::lock_guard<std::mutex> flk(file_mu_);
+    if (key32 == nullptr || len == 0) {
+        encrypted_ = false;
+        enc_key_.fill(0);
+        nonce_salt_.fill(0);
+        return;
+    }
+    if (len == 32) {
+        std::memcpy(enc_key_.data(), key32, 32);
+    } else {
+        uint8_t unused_snap[32]{};
+        crypto::hkdf_derive_keys(key32, len, enc_key_.data(), unused_snap);
+    }
+    crypto::random_bytes(nonce_salt_.data(), nonce_salt_.size());
+    encrypted_ = true;
 }
 
 bool WalManager::open(const std::string& wal_path, uint32_t flush_ms) {
@@ -318,17 +370,35 @@ void WalManager::drain_and_write() {
         return;
     }
 
+    bool use_enc = false;
+    std::array<uint8_t, 32> key_copy{};
+    std::array<uint8_t, 4> salt_copy{};
+    if (!batch.empty()) {
+        std::lock_guard<std::mutex> flk(file_mu_);
+        use_enc = encrypted_;
+        if (use_enc) {
+            key_copy = enc_key_;
+            salt_copy = nonce_salt_;
+        }
+    }
+
     std::vector<uint8_t> encoded;
     uint64_t max_lsn = prev_flushed;
     if (!batch.empty()) {
+        const size_t overhead = use_enc ? 37u : 21u;
         size_t total_bytes = 0;
         for (const auto& s : batch) {
-            total_bytes += 21 + s.sql.size();
+            total_bytes += overhead + s.sql.size();
         }
         encoded.reserve(total_bytes);
 
         for (const auto& s : batch) {
-            serialize_record(encoded, s.lsn, s.op, s.sql);
+            if (use_enc) {
+                serialize_record_encrypted(encoded, s.lsn, s.op, s.sql,
+                                           key_copy.data(), salt_copy.data());
+            } else {
+                serialize_record(encoded, s.lsn, s.op, s.sql);
+            }
             if (s.lsn > max_lsn) {
                 max_lsn = s.lsn;
             }
@@ -360,7 +430,10 @@ void WalManager::drain_and_write() {
     flush_cv_.notify_all();
 }
 
-std::vector<WalRecord> WalManager::replay() const {
+std::vector<WalRecord> WalManager::replay(bool* auth_failed) const {
+    if (auth_failed) {
+        *auth_failed = false;
+    }
     std::vector<WalRecord> records;
     std::lock_guard<std::mutex> flk(const_cast<std::mutex&>(file_mu_));
 
@@ -383,35 +456,93 @@ std::vector<WalRecord> WalManager::replay() const {
     buf.resize(read_bytes);
 
     size_t pos = 0;
-    // Header: 4 (magic) + 8 (lsn) + 1 (op) + 4 (len) = 17 bytes, + 4 (crc) = 21 bytes min
-    while (pos + 21 <= buf.size()) {
+    while (pos + 4 <= buf.size()) {
         const uint32_t magic = read_u32_le(buf.data() + pos);
-        if (magic != MAGIC) {
+        if (magic == MAGIC) {
+            if (encrypted_) {
+                if (auth_failed) {
+                    *auth_failed = true;
+                }
+                break;
+            }
+            // Plaintext: 4 (magic) + 8 (lsn) + 1 (op) + 4 (len) + len + 4 (crc) = 21 + len
+            if (pos + 21 > buf.size()) {
+                break; // partial tail record
+            }
+            const size_t crc_start = pos + 4;
+            const uint64_t lsn = read_u64_le(buf.data() + pos + 4);
+            const uint8_t op = buf[pos + 12];
+            const uint32_t len = read_u32_le(buf.data() + pos + 13);
+
+            if (len > buf.size() - pos - 21) {
+                break; // partial tail record
+            }
+
+            const uint32_t expected_crc = read_u32_le(buf.data() + pos + 17 + len);
+            const uint32_t actual_crc = crc32_update(0, buf.data() + crc_start, 13 + len);
+            if (expected_crc != actual_crc) {
+                break; // corrupt tail record
+            }
+
+            WalRecord rec;
+            rec.lsn = lsn;
+            rec.op = op;
+            if (len > 0) {
+                rec.sql.assign(reinterpret_cast<const char*>(buf.data() + pos + 17), len);
+            }
+            records.push_back(std::move(rec));
+            pos += 21 + len;
+        } else if (magic == MAGIC_ENCRYPTED) {
+            if (!encrypted_) {
+                if (auth_failed) {
+                    *auth_failed = true;
+                }
+                break;
+            }
+            // Encrypted: [magic:4][salt:4][lsn:8][op:1][len:4][ct:len][tag:16] = 37 + len
+            if (pos + 37 > buf.size()) {
+                break; // partial tail record
+            }
+            const uint64_t lsn = read_u64_le(buf.data() + pos + 8);
+            const uint8_t op = buf[pos + 16];
+            const uint32_t len = read_u32_le(buf.data() + pos + 17);
+
+            if (len > buf.size() - pos - 37) {
+                break; // partial tail record
+            }
+
+            // nonce = salt(4) || lsn(8)
+            uint8_t nonce[12];
+            std::memcpy(nonce, buf.data() + pos + 4, 4);
+            std::memcpy(nonce + 4, buf.data() + pos + 8, 8);
+
+            // aad = magic(4) || lsn(8) || op(1) || len(4)
+            uint8_t aad[17];
+            std::memcpy(aad, buf.data() + pos, 4);
+            std::memcpy(aad + 4, buf.data() + pos + 8, 13);
+
+            const uint8_t* ct = (len > 0) ? (buf.data() + pos + 21) : nullptr;
+            const uint8_t* tag = buf.data() + pos + 21 + len;
+
+            WalRecord rec;
+            rec.lsn = lsn;
+            rec.op = op;
+            rec.sql.resize(len);
+            uint8_t* pt_out = (len > 0) ? reinterpret_cast<uint8_t*>(rec.sql.data()) : nullptr;
+
+            if (!crypto::aead_decrypt(enc_key_.data(), nonce, aad, sizeof(aad),
+                                      ct, len, tag, pt_out)) {
+                if (auth_failed) {
+                    *auth_failed = true;
+                }
+                break;
+            }
+
+            records.push_back(std::move(rec));
+            pos += 37 + len;
+        } else {
             break;
         }
-        const size_t crc_start = pos + 4;
-        const uint64_t lsn = read_u64_le(buf.data() + pos + 4);
-        const uint8_t op = buf[pos + 12];
-        const uint32_t len = read_u32_le(buf.data() + pos + 13);
-
-        if (pos + 21 + len > buf.size()) {
-            break; // partial tail record
-        }
-
-        const uint32_t expected_crc = read_u32_le(buf.data() + pos + 17 + len);
-        const uint32_t actual_crc = crc32_update(0, buf.data() + crc_start, 13 + len);
-        if (expected_crc != actual_crc) {
-            break; // corrupt tail record
-        }
-
-        WalRecord rec;
-        rec.lsn = lsn;
-        rec.op = op;
-        if (len > 0) {
-            rec.sql.assign(reinterpret_cast<const char*>(buf.data() + pos + 17), len);
-        }
-        records.push_back(std::move(rec));
-        pos += 21 + len;
     }
 
     return records;
@@ -428,12 +559,17 @@ void WalManager::truncate(uint64_t up_to_lsn) {
         }
     }
 
+    std::lock_guard<std::mutex> flk(file_mu_);
     std::vector<uint8_t> encoded;
     for (const auto& rec : keep) {
-        serialize_record(encoded, rec.lsn, rec.op, rec.sql);
+        if (encrypted_) {
+            serialize_record_encrypted(encoded, rec.lsn, rec.op, rec.sql,
+                                       enc_key_.data(), nonce_salt_.data());
+        } else {
+            serialize_record(encoded, rec.lsn, rec.op, rec.sql);
+        }
     }
 
-    std::lock_guard<std::mutex> flk(file_mu_);
     std::FILE* fp = std::fopen(wal_path_.c_str(), "wb");
     if (fp) {
         if (!encoded.empty()) {

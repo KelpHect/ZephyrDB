@@ -19,6 +19,8 @@ namespace zephyr::storage {
 /// std::vector<uint8_t> fallback on Emscripten.
 class MmapStore {
 public:
+    static constexpr uint32_t SNAP_ENC_MAGIC = 0x5A534E45u; // "ZSNE"
+
     MmapStore() = default;
     ~MmapStore();
 
@@ -30,6 +32,19 @@ public:
 
     /// Atomically write a snapshot blob via temp file + replace.
     bool write_snapshot(const std::string& path, const std::vector<uint8_t>& blob);
+
+    /// Atomically write an AEAD-encrypted snapshot via temp file + OS flush + replace.
+    /// Format: [magic:4][nonce:12][len:8][ct:len][tag:16]
+    bool write_snapshot_encrypted(const std::string& path,
+                                  const std::vector<uint8_t>& blob,
+                                  const uint8_t key32[32]);
+
+    /// Read and authenticate an AEAD-encrypted snapshot file into `out_blob`.
+    /// Sets `*auth_failed = true` (if non-null) on magic/length mismatch or AEAD failure.
+    bool read_snapshot_encrypted(const std::string& path,
+                                 const uint8_t key32[32],
+                                 std::vector<uint8_t>& out_blob,
+                                 bool* auth_failed = nullptr);
 
     /// Memory-map an existing snapshot file read-only.
     bool open_mmap(const std::string& path);

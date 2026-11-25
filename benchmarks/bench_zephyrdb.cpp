@@ -67,6 +67,24 @@ int main() {
         std::cout << "Augmented B-Tree upsert_batch 100k: " << ms << " ms (" << (ROWS / (ms / 1000.0) / 1e6) << " M ops/s)\n";
     }
 
+    // 2c. Augmented B-Tree upsert_batch_columnar 100k rows
+    {
+        zephyr::core::AugmentedBTree col_tree(&reaper);
+        std::vector<int64_t> keys(ROWS);
+        std::vector<uint64_t> rids(ROWS);
+        std::vector<int64_t> vals(ROWS);
+        for (int i = 0; i < ROWS; ++i) {
+            keys[i] = i + 1;
+            rids[i] = static_cast<uint64_t>(i + 1);
+            vals[i] = i + 1;
+        }
+        auto t0 = Clock::now();
+        col_tree.upsert_batch_columnar(keys.data(), rids.data(), vals.data(), ROWS);
+        auto t1 = Clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::cout << "Augmented B-Tree upsert_batch_columnar 100k: " << ms << " ms (" << (ROWS / (ms / 1000.0) / 1e6) << " M ops/s)\n";
+    }
+
     {
         constexpr int PROBES = 1000000;
         uint64_t sink = 0;
@@ -283,6 +301,59 @@ int main() {
         double ssec = std::chrono::duration<double>(s1 - s0).count();
         std::cout << "Same-table sharded PK updates (4 threads): "
                   << (sharded_ops.load() / ssec / 1e6) << " M updates/sec\n";
+
+        // 5g. 99% Everyday SQL (1 insert, 50 inserts, 1 PK read, 50 PK reads, Leaderboard JOIN)
+        ZephyrStmt* pk_ins = zephyr_prepare(db, "INSERT INTO items VALUES ($1, $2);");
+        ZephyrStmt* pk_sel = zephyr_prepare(db, "SELECT id, gold FROM items WHERE id = $1;");
+        {
+            ZephyrValue ip[2]{};
+            ip[0].type = ZEPHYR_TYPE_I64; ip[0].as.i64 = 999999;
+            ip[1].type = ZEPHYR_TYPE_I64; ip[1].as.i64 = 42;
+            auto i0 = Clock::now();
+            zephyr_stmt_exec(pk_ins, ip, 2, nullptr);
+            auto i1 = Clock::now();
+            std::cout << "Everyday SQL (1 INSERT): "
+                      << std::chrono::duration<double, std::micro>(i1 - i0).count() << " us\n";
+        }
+        {
+            auto i0 = Clock::now();
+            for (int i = 0; i < 50; ++i) {
+                ZephyrValue ip[2]{};
+                ip[0].type = ZEPHYR_TYPE_I64; ip[0].as.i64 = 1000000 + i;
+                ip[1].type = ZEPHYR_TYPE_I64; ip[1].as.i64 = i * 10;
+                zephyr_stmt_exec(pk_ins, ip, 2, nullptr);
+            }
+            auto i1 = Clock::now();
+            std::cout << "Everyday SQL (50 INSERTs): "
+                      << std::chrono::duration<double, std::micro>(i1 - i0).count() << " us\n";
+        }
+        {
+            constexpr int R = 10000;
+            ZephyrValue sp{};
+            sp.type = ZEPHYR_TYPE_I64; sp.as.i64 = 5000;
+            auto r0 = Clock::now();
+            for (int i = 0; i < R; ++i) {
+                ZephyrResultSet* rs = zephyr_stmt_query(pk_sel, &sp, 1);
+                zephyr_result_free(rs);
+            }
+            auto r1 = Clock::now();
+            double us_per_read = std::chrono::duration<double, std::micro>(r1 - r0).count() / R;
+            std::cout << "Everyday SQL (1 PK SELECT, 10k rows): " << us_per_read << " us\n";
+            std::cout << "Everyday SQL (50 PK SELECTs, 10k rows): " << (us_per_read * 50.0) << " us\n";
+        }
+        {
+            ZephyrStmt* lb = zephyr_prepare(db,
+                "SELECT a.id, a.gold FROM items a INNER JOIN items2 b ON a.id = b.id ORDER BY a.gold DESC LIMIT 10;");
+            auto l0 = Clock::now();
+            ZephyrResultSet* rs = zephyr_stmt_query(lb, nullptr, 0);
+            auto l1 = Clock::now();
+            zephyr_result_free(rs);
+            std::cout << "Everyday SQL (JOIN + ORDER BY LIMIT 10): "
+                      << std::chrono::duration<double, std::micro>(l1 - l0).count() << " us\n";
+            zephyr_stmt_free(lb);
+        }
+        zephyr_stmt_free(pk_ins);
+        zephyr_stmt_free(pk_sel);
 
         zephyr_stmt_free(r_stmt);
         zephyr_stmt_free(w1);

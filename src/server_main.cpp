@@ -23,19 +23,21 @@ void print_usage(const char* prog) {
     std::cout
         << "Usage: " << prog << " [options]\n"
         << "Options:\n"
-        << "  --data-dir <path>      Database directory (default: ./zephyr_data)\n"
-        << "  --pgwire-port <port>   PostgreSQL wire protocol TCP port (default: 5432, 0=disabled)\n"
-        << "  --studio-port <port>   Zephyr Studio HTTP Web UI port (default: 0=disabled)\n"
-        << "  --raft-id <id>         Raft node ID (default: 0 = standalone)\n"
-        << "  --raft-port <port>     Raft UDP port (default: 7000)\n"
-        << "  --peers <csv>          Raft peer list (e.g. 2@127.0.0.1:7002,3@127.0.0.1:7003)\n"
-        << "  --help                 Show this help message\n";
+        << "  --data-dir <path>         Database directory (default: ./zephyr_data)\n"
+        << "  --encryption-key <secret> Enable ChaCha20-Poly1305 AEAD encryption at rest\n"
+        << "  --pgwire-port <port>      PostgreSQL wire protocol TCP port (default: 5432, 0=disabled)\n"
+        << "  --studio-port <port>      Zephyr Studio HTTP Web UI port (default: 0=disabled)\n"
+        << "  --raft-id <id>            Raft node ID (default: 0 = standalone)\n"
+        << "  --raft-port <port>        Raft UDP port (default: 7000)\n"
+        << "  --peers <csv>             Raft peer list (e.g. 2@127.0.0.1:7002,3@127.0.0.1:7003)\n"
+        << "  --help                    Show this help message\n";
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
     std::string data_dir = "./zephyr_data";
+    std::string encryption_key;
     uint16_t pgwire_port = 5432;
     uint16_t studio_port = 0;
     uint32_t raft_id = 0;
@@ -49,6 +51,8 @@ int main(int argc, char** argv) {
             return 0;
         } else if (arg == "--data-dir" && i + 1 < argc) {
             data_dir = argv[++i];
+        } else if (arg == "--encryption-key" && i + 1 < argc) {
+            encryption_key = argv[++i];
         } else if (arg == "--pgwire-port" && i + 1 < argc) {
             pgwire_port = static_cast<uint16_t>(std::stoul(argv[++i]));
         } else if (arg == "--studio-port" && i + 1 < argc) {
@@ -71,10 +75,23 @@ int main(int argc, char** argv) {
 
     ZephyrConfig cfg = zephyr_default_config();
     cfg.data_dir = data_dir.c_str();
-    ZephyrDB* db = zephyr_db_open(&cfg);
+    ZephyrDB* db = nullptr;
+    if (!encryption_key.empty()) {
+        db = zephyr_db_open_encrypted(
+            &cfg,
+            reinterpret_cast<const uint8_t*>(encryption_key.data()),
+            static_cast<uint32_t>(encryption_key.size()));
+    } else {
+        db = zephyr_db_open(&cfg);
+    }
     if (!db) {
-        std::cerr << "Failed to open ZephyrDB at " << data_dir << "\n";
+        std::cerr << "Failed to open ZephyrDB at " << data_dir
+                  << (encryption_key.empty() ? "" : " (encryption authentication failed)")
+                  << "\n";
         return 1;
+    }
+    if (!encryption_key.empty()) {
+        std::cout << "[Security] ChaCha20-Poly1305 AEAD encryption at rest enabled\n";
     }
 
     zephyr::net::RaftNode raft;

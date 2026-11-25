@@ -33,8 +33,46 @@ inline size_t fast_upper_bound(const int64_t* keys, size_t n, int64_t key) noexc
 } // namespace
 
 // ----------------------------------------------------------------------------
-// InternalPool & LeafPool
+// InternalPool & LeafPool (with Per-Thread Node Pool Caches)
 // ----------------------------------------------------------------------------
+
+struct AugmentedBTree::InternalPool::LocalCache {
+    static constexpr size_t CAP = InternalPool::LOCAL_CACHE_CAP;
+    static constexpr size_t REFILL_BATCH = 32;
+    static constexpr size_t FLUSH_BATCH = 64;
+
+    InternalPool* pool = nullptr;
+    std::array<InternalNode*, CAP> nodes{};
+    size_t count = 0;
+
+    LocalCache() : pool(&AugmentedBTree::internal_pool()) {}
+
+    ~LocalCache() {
+        if (pool && count > 0) {
+            pool->recycle_batch(nodes.data(), count);
+            count = 0;
+        }
+    }
+};
+
+struct AugmentedBTree::LeafPool::LocalCache {
+    static constexpr size_t CAP = LeafPool::LOCAL_CACHE_CAP;
+    static constexpr size_t REFILL_BATCH = 32;
+    static constexpr size_t FLUSH_BATCH = 64;
+
+    LeafPool* pool = nullptr;
+    std::array<LeafNode*, CAP> nodes{};
+    size_t count = 0;
+
+    LocalCache() : pool(&AugmentedBTree::leaf_pool()) {}
+
+    ~LocalCache() {
+        if (pool && count > 0) {
+            pool->recycle_batch(nodes.data(), count);
+            count = 0;
+        }
+    }
+};
 
 AugmentedBTree::InternalPool::InternalPool() {
     free_list_.reserve(256);
@@ -48,19 +86,47 @@ AugmentedBTree::InternalPool::~InternalPool() {
     free_list_.clear();
 }
 
-AugmentedBTree::InternalNode* AugmentedBTree::InternalPool::alloc_internal() {
-    InternalNode* n = nullptr;
+size_t AugmentedBTree::InternalPool::alloc_batch(InternalNode** out, size_t max_count) noexcept {
+    std::lock_guard<std::mutex> lk(pool_mu_);
+    const size_t avail = free_list_.size();
+    const size_t take = avail < max_count ? avail : max_count;
+    for (size_t i = 0; i < take; ++i) {
+        out[i] = free_list_.back();
+        free_list_.pop_back();
+    }
+    return take;
+}
+
+void AugmentedBTree::InternalPool::recycle_batch(InternalNode** nodes, size_t count) noexcept {
+    if (count == 0) return;
+    size_t overflow_start = count;
     {
         std::lock_guard<std::mutex> lk(pool_mu_);
-        if (!free_list_.empty()) {
-            n = free_list_.back();
-            free_list_.pop_back();
+        const size_t space = (free_list_.size() < MAX_POOLED_NODES)
+            ? (MAX_POOLED_NODES - free_list_.size())
+            : 0;
+        const size_t keep = count < space ? count : space;
+        for (size_t i = 0; i < keep; ++i) {
+            free_list_.push_back(nodes[i]);
         }
+        overflow_start = keep;
     }
-    if (!n) {
-        n = new InternalNode();
+    for (size_t i = overflow_start; i < count; ++i) {
+        delete nodes[i];
     }
-    return n;
+}
+
+AugmentedBTree::InternalNode* AugmentedBTree::InternalPool::alloc_internal() {
+    static thread_local LocalCache tls_cache;
+    if (tls_cache.count > 0) [[likely]] {
+        return tls_cache.nodes[--tls_cache.count];
+    }
+    const size_t fetched = alloc_batch(tls_cache.nodes.data(), LocalCache::REFILL_BATCH);
+    if (fetched > 0) {
+        tls_cache.count = fetched - 1;
+        return tls_cache.nodes[tls_cache.count];
+    }
+    return new InternalNode();
 }
 
 void AugmentedBTree::InternalPool::recycle_internal(InternalNode* n) noexcept {
@@ -75,14 +141,16 @@ void AugmentedBTree::InternalPool::recycle_internal(InternalNode* n) noexcept {
     n->col_sum_i64.fill(0);
     n->col_sum_f64.fill(0.0);
     n->children.fill(nullptr);
-    {
-        std::lock_guard<std::mutex> lk(pool_mu_);
-        if (free_list_.size() < MAX_POOLED_NODES) {
-            free_list_.push_back(n);
-            return;
-        }
+
+    static thread_local LocalCache tls_cache;
+    if (tls_cache.count < LocalCache::CAP) [[likely]] {
+        tls_cache.nodes[tls_cache.count++] = n;
+        return;
     }
-    delete n;
+    constexpr size_t flush_n = LocalCache::FLUSH_BATCH;
+    recycle_batch(tls_cache.nodes.data() + (LocalCache::CAP - flush_n), flush_n);
+    tls_cache.count = LocalCache::CAP - flush_n;
+    tls_cache.nodes[tls_cache.count++] = n;
 }
 
 AugmentedBTree::LeafPool::LeafPool() {
@@ -97,19 +165,47 @@ AugmentedBTree::LeafPool::~LeafPool() {
     free_list_.clear();
 }
 
-AugmentedBTree::LeafNode* AugmentedBTree::LeafPool::alloc_leaf() {
-    LeafNode* n = nullptr;
+size_t AugmentedBTree::LeafPool::alloc_batch(LeafNode** out, size_t max_count) noexcept {
+    std::lock_guard<std::mutex> lk(pool_mu_);
+    const size_t avail = free_list_.size();
+    const size_t take = avail < max_count ? avail : max_count;
+    for (size_t i = 0; i < take; ++i) {
+        out[i] = free_list_.back();
+        free_list_.pop_back();
+    }
+    return take;
+}
+
+void AugmentedBTree::LeafPool::recycle_batch(LeafNode** nodes, size_t count) noexcept {
+    if (count == 0) return;
+    size_t overflow_start = count;
     {
         std::lock_guard<std::mutex> lk(pool_mu_);
-        if (!free_list_.empty()) {
-            n = free_list_.back();
-            free_list_.pop_back();
+        const size_t space = (free_list_.size() < MAX_POOLED_NODES)
+            ? (MAX_POOLED_NODES - free_list_.size())
+            : 0;
+        const size_t keep = count < space ? count : space;
+        for (size_t i = 0; i < keep; ++i) {
+            free_list_.push_back(nodes[i]);
         }
+        overflow_start = keep;
     }
-    if (!n) {
-        n = new LeafNode();
+    for (size_t i = overflow_start; i < count; ++i) {
+        delete nodes[i];
     }
-    return n;
+}
+
+AugmentedBTree::LeafNode* AugmentedBTree::LeafPool::alloc_leaf() {
+    static thread_local LocalCache tls_cache;
+    if (tls_cache.count > 0) [[likely]] {
+        return tls_cache.nodes[--tls_cache.count];
+    }
+    const size_t fetched = alloc_batch(tls_cache.nodes.data(), LocalCache::REFILL_BATCH);
+    if (fetched > 0) {
+        tls_cache.count = fetched - 1;
+        return tls_cache.nodes[tls_cache.count];
+    }
+    return new LeafNode();
 }
 
 void AugmentedBTree::LeafPool::recycle_leaf(LeafNode* n) noexcept {
@@ -125,14 +221,16 @@ void AugmentedBTree::LeafPool::recycle_leaf(LeafNode* n) noexcept {
     n->max_key = INT64_MIN;
     n->col_sum_i64.fill(0);
     n->col_sum_f64.fill(0.0);
-    {
-        std::lock_guard<std::mutex> lk(pool_mu_);
-        if (free_list_.size() < MAX_POOLED_NODES) {
-            free_list_.push_back(n);
-            return;
-        }
+
+    static thread_local LocalCache tls_cache;
+    if (tls_cache.count < LocalCache::CAP) [[likely]] {
+        tls_cache.nodes[tls_cache.count++] = n;
+        return;
     }
-    delete n;
+    constexpr size_t flush_n = LocalCache::FLUSH_BATCH;
+    recycle_batch(tls_cache.nodes.data() + (LocalCache::CAP - flush_n), flush_n);
+    tls_cache.count = LocalCache::CAP - flush_n;
+    tls_cache.nodes[tls_cache.count++] = n;
 }
 
 AugmentedBTree::InternalPool& AugmentedBTree::internal_pool() noexcept {
@@ -700,6 +798,57 @@ AugmentedBTree::InsertResult AugmentedBTree::insert_recursive(
             child_res.delta_count, child_res.delta_i64, child_res.delta_f64};
 }
 
+AugmentedBTree::NodeHeader* AugmentedBTree::build_internal_levels_bottom_up(
+    std::vector<NodeHeader*>& level) {
+    // Build internal levels bottom-up in O(N) time with zero path-copying.
+    constexpr size_t INTERNAL_FILL_CHILDREN = 29; // 28 separator keys <= ORDER (32)
+    while (level.size() > 1) {
+        const size_t total = level.size();
+        const size_t num_parents = (total + INTERNAL_FILL_CHILDREN - 1) / INTERNAL_FILL_CHILDREN;
+        std::vector<NodeHeader*> next_level;
+        next_level.reserve(num_parents);
+
+        size_t offset = 0;
+        for (size_t p = 0; p < num_parents; ++p) {
+            const size_t remaining_children = total - offset;
+            const size_t remaining_parents = num_parents - p;
+            // Avoid a 1-child trailing internal node by balancing the final two parents.
+            size_t cnt = std::min(INTERNAL_FILL_CHILDREN, remaining_children);
+            if (remaining_parents == 2 && remaining_children == INTERNAL_FILL_CHILDREN + 1) {
+                cnt = remaining_children / 2;
+            }
+
+            InternalNode* parent = alloc_internal();
+            parent->is_leaf = false;
+            parent->batch_gen = 0;
+            parent->num_keys = static_cast<uint16_t>(cnt - 1);
+            parent->count = 0;
+            parent->min_key = level[offset]->min_key;
+            parent->max_key = level[offset + cnt - 1]->max_key;
+            parent->col_sum_i64.fill(0);
+            parent->col_sum_f64.fill(0.0);
+
+            for (size_t j = 0; j < cnt; ++j) {
+                NodeHeader* child = level[offset + j];
+                parent->children[j] = child;
+                if (j > 0) {
+                    parent->keys[j - 1] = child->min_key;
+                }
+                parent->count += child->count;
+                for (size_t c = 0; c < MAX_AGG_COLS; ++c) {
+                    parent->col_sum_i64[c] += child->col_sum_i64[c];
+                    parent->col_sum_f64[c] += child->col_sum_f64[c];
+                }
+            }
+            offset += cnt;
+            next_level.push_back(parent);
+        }
+        level = std::move(next_level);
+    }
+
+    return level[0];
+}
+
 AugmentedBTree::NodeHeader* AugmentedBTree::bulk_load_empty(const std::vector<BatchEntry>& entries) {
     if (entries.empty()) return nullptr;
 
@@ -773,53 +922,116 @@ AugmentedBTree::NodeHeader* AugmentedBTree::bulk_load_empty(const std::vector<Ba
         level.push_back(leaf);
     }
 
-    // Build internal levels bottom-up in O(N) time with zero path-copying.
-    constexpr size_t INTERNAL_FILL_CHILDREN = 29; // 28 separator keys <= ORDER (32)
-    while (level.size() > 1) {
-        const size_t total = level.size();
-        const size_t num_parents = (total + INTERNAL_FILL_CHILDREN - 1) / INTERNAL_FILL_CHILDREN;
-        std::vector<NodeHeader*> next_level;
-        next_level.reserve(num_parents);
+    return build_internal_levels_bottom_up(level);
+}
 
-        size_t offset = 0;
-        for (size_t p = 0; p < num_parents; ++p) {
-            const size_t remaining_children = total - offset;
-            const size_t remaining_parents = num_parents - p;
-            // Avoid a 1-child trailing internal node by balancing the final two parents.
-            size_t cnt = std::min(INTERNAL_FILL_CHILDREN, remaining_children);
-            if (remaining_parents == 2 && remaining_children == INTERNAL_FILL_CHILDREN + 1) {
-                cnt = remaining_children / 2;
-            }
+AugmentedBTree::NodeHeader* AugmentedBTree::bulk_load_empty_columnar(
+    const int64_t* keys,
+    const uint64_t* row_ids,
+    const int64_t* col0_i64,
+    size_t count) {
+    if (count == 0 || !keys || !row_ids) return nullptr;
 
-            InternalNode* parent = alloc_internal();
-            parent->is_leaf = false;
-            parent->batch_gen = 0;
-            parent->num_keys = static_cast<uint16_t>(cnt - 1);
-            parent->count = 0;
-            parent->min_key = level[offset]->min_key;
-            parent->max_key = level[offset + cnt - 1]->max_key;
-            parent->col_sum_i64.fill(0);
-            parent->col_sum_f64.fill(0.0);
-
-            for (size_t j = 0; j < cnt; ++j) {
-                NodeHeader* child = level[offset + j];
-                parent->children[j] = child;
-                if (j > 0) {
-                    parent->keys[j - 1] = child->min_key;
-                }
-                parent->count += child->count;
-                for (size_t c = 0; c < MAX_AGG_COLS; ++c) {
-                    parent->col_sum_i64[c] += child->col_sum_i64[c];
-                    parent->col_sum_f64[c] += child->col_sum_f64[c];
-                }
-            }
-            offset += cnt;
-            next_level.push_back(parent);
+    bool strictly_sorted = true;
+    for (size_t i = 1; i < count; ++i) {
+        if (keys[i - 1] >= keys[i]) {
+            strictly_sorted = false;
+            break;
         }
-        level = std::move(next_level);
     }
 
-    return level[0];
+    std::vector<size_t> order;
+    size_t n_unique = count;
+    if (!strictly_sorted) {
+        order.resize(count);
+        for (size_t i = 0; i < count; ++i) {
+            order[i] = i;
+        }
+        std::stable_sort(order.begin(), order.end(),
+                         [keys](size_t a, size_t b) {
+                             return keys[a] < keys[b];
+                         });
+        size_t write_idx = 0;
+        for (size_t i = 0; i < order.size(); ++i) {
+            if (i + 1 < order.size() && keys[order[i]] == keys[order[i + 1]]) {
+                continue;
+            }
+            order[write_idx++] = order[i];
+        }
+        order.resize(write_idx);
+        n_unique = write_idx;
+    }
+
+    constexpr size_t LEAF_FILL = 28;
+    const size_t num_leaves = (n_unique + LEAF_FILL - 1) / LEAF_FILL;
+    std::vector<NodeHeader*> level;
+    level.reserve(num_leaves);
+
+    if (strictly_sorted) {
+        for (size_t l = 0; l < num_leaves; ++l) {
+            const size_t start = l * LEAF_FILL;
+            const size_t end = std::min(start + LEAF_FILL, n_unique);
+            const size_t cnt = end - start;
+
+            LeafNode* leaf = alloc_leaf();
+            leaf->is_leaf = true;
+            leaf->batch_gen = 0;
+            leaf->num_keys = static_cast<uint16_t>(cnt);
+            leaf->count = cnt;
+            leaf->min_key = keys[start];
+            leaf->max_key = keys[end - 1];
+            leaf->col_sum_i64.fill(0);
+            leaf->col_sum_f64.fill(0.0);
+
+            int64_t sum0 = 0;
+            for (size_t j = 0; j < cnt; ++j) {
+                const size_t src = start + j;
+                const int64_t v0 = col0_i64 ? col0_i64[src] : 0;
+                leaf->keys[j] = keys[src];
+                leaf->row_ids[j] = row_ids[src];
+                leaf->row_i64_inline[j][0] = v0;
+                leaf->row_i64_inline[j][1] = 0;
+                leaf->row_f64_inline[j][0] = 0.0;
+                leaf->row_f64_inline[j][1] = 0.0;
+                sum0 += v0;
+            }
+            leaf->col_sum_i64[0] = sum0;
+            level.push_back(leaf);
+        }
+    } else {
+        for (size_t l = 0; l < num_leaves; ++l) {
+            const size_t start = l * LEAF_FILL;
+            const size_t end = std::min(start + LEAF_FILL, n_unique);
+            const size_t cnt = end - start;
+
+            LeafNode* leaf = alloc_leaf();
+            leaf->is_leaf = true;
+            leaf->batch_gen = 0;
+            leaf->num_keys = static_cast<uint16_t>(cnt);
+            leaf->count = cnt;
+            leaf->min_key = keys[order[start]];
+            leaf->max_key = keys[order[end - 1]];
+            leaf->col_sum_i64.fill(0);
+            leaf->col_sum_f64.fill(0.0);
+
+            int64_t sum0 = 0;
+            for (size_t j = 0; j < cnt; ++j) {
+                const size_t src = order[start + j];
+                const int64_t v0 = col0_i64 ? col0_i64[src] : 0;
+                leaf->keys[j] = keys[src];
+                leaf->row_ids[j] = row_ids[src];
+                leaf->row_i64_inline[j][0] = v0;
+                leaf->row_i64_inline[j][1] = 0;
+                leaf->row_f64_inline[j][0] = 0.0;
+                leaf->row_f64_inline[j][1] = 0.0;
+                sum0 += v0;
+            }
+            leaf->col_sum_i64[0] = sum0;
+            level.push_back(leaf);
+        }
+    }
+
+    return build_internal_levels_bottom_up(level);
 }
 
 AugmentedBTree::NodeHeader* AugmentedBTree::upsert_into_root(
@@ -901,6 +1113,174 @@ void AugmentedBTree::upsert_batch(const std::vector<BatchEntry>& entries) {
 
     root_.store(working_root, std::memory_order_release);
     retire_root(old_root);
+}
+
+void AugmentedBTree::upsert_batch_columnar(const int64_t* keys,
+                                           const uint64_t* row_ids,
+                                           const int64_t* col0_i64,
+                                           size_t count) {
+    if (count == 0 || !keys || !row_ids) return;
+
+    std::lock_guard<std::mutex> lk(write_mu_);
+    NodeHeader* old_root = root_.load(std::memory_order_acquire);
+
+    if (old_root == nullptr) {
+        NodeHeader* new_root = bulk_load_empty_columnar(keys, row_ids, col0_i64, count);
+        root_.store(new_root, std::memory_order_release);
+        return;
+    }
+
+    const uint64_t cur_gen = ++next_batch_gen_;
+    NodeHeader* working_root = old_root;
+    std::array<int64_t, MAX_AGG_COLS> i64_vals{};
+    const std::array<double, MAX_AGG_COLS> f64_vals{};
+
+    for (size_t i = 0; i < count; ++i) {
+        i64_vals[0] = col0_i64 ? col0_i64[i] : 0;
+        NodeHeader* next_root = upsert_into_root(
+            working_root, keys[i], row_ids[i], i64_vals, f64_vals, cur_gen);
+        if (next_root != working_root && working_root != old_root) {
+            release_node(working_root);
+        }
+        working_root = next_root;
+    }
+
+    root_.store(working_root, std::memory_order_release);
+    retire_root(old_root);
+}
+
+bool AugmentedBTree::update_existing_i64(int64_t key, size_t col, int64_t delta_i64) {
+    if (col >= MAX_AGG_COLS) return false;
+
+    std::lock_guard<std::mutex> lk(write_mu_);
+    NodeHeader* root = root_.load(std::memory_order_acquire);
+    if (!root) return false;
+
+    NodeHeader* path[32];
+    size_t depth = 0;
+    bool all_unique = true;
+    NodeHeader* cur = root;
+
+    while (!cur->is_leaf) {
+        if (cur->refcount.load(std::memory_order_acquire) != 1) {
+            all_unique = false;
+        }
+        if (depth < 32) {
+            path[depth++] = cur;
+        } else {
+            all_unique = false;
+        }
+        auto* in = static_cast<InternalNode*>(cur);
+        const size_t idx = fast_upper_bound(in->keys.data(), in->num_keys, key);
+        cur = in->children[idx];
+        if (!cur) return false;
+    }
+
+    if (cur->refcount.load(std::memory_order_acquire) != 1) {
+        all_unique = false;
+    }
+    auto* leaf = static_cast<LeafNode*>(cur);
+    const size_t pos = fast_lower_bound(leaf->keys.data(), leaf->num_keys, key);
+    if (pos >= leaf->num_keys || leaf->keys[pos] != key) {
+        return false;
+    }
+
+    if (delta_i64 == 0) {
+        return true;
+    }
+
+    // Zero-clone in-place delta when every node on root-to-leaf path is uniquely owned.
+    if (all_unique && (col < INLINE_AGG_COLS || leaf->extra != nullptr)) [[likely]] {
+        if (col < INLINE_AGG_COLS) {
+            leaf->row_i64_inline[pos][col] += delta_i64;
+        } else {
+            leaf->extra->i64[pos][col - INLINE_AGG_COLS] += delta_i64;
+        }
+        leaf->col_sum_i64[col] += delta_i64;
+        for (size_t i = depth; i > 0; --i) {
+            path[i - 1]->col_sum_i64[col] += delta_i64;
+        }
+        return true;
+    }
+
+    // Fallback to CoW path copy when any node is shared (refcount > 1) or extra needs allocation.
+    std::array<int64_t, MAX_AGG_COLS> i64_vals{};
+    std::array<double, MAX_AGG_COLS> f64_vals{};
+    for (size_t c = 0; c < MAX_AGG_COLS; ++c) {
+        i64_vals[c] = leaf->get_row_i64(pos, c);
+        f64_vals[c] = leaf->get_row_f64(pos, c);
+    }
+    i64_vals[col] += delta_i64;
+    NodeHeader* new_root = upsert_into_root(root, key, leaf->row_ids[pos], i64_vals, f64_vals, 0);
+    root_.store(new_root, std::memory_order_release);
+    retire_root(root);
+    return true;
+}
+
+bool AugmentedBTree::update_existing_f64(int64_t key, size_t col, double delta_f64) {
+    if (col >= MAX_AGG_COLS) return false;
+
+    std::lock_guard<std::mutex> lk(write_mu_);
+    NodeHeader* root = root_.load(std::memory_order_acquire);
+    if (!root) return false;
+
+    NodeHeader* path[32];
+    size_t depth = 0;
+    bool all_unique = true;
+    NodeHeader* cur = root;
+
+    while (!cur->is_leaf) {
+        if (cur->refcount.load(std::memory_order_acquire) != 1) {
+            all_unique = false;
+        }
+        if (depth < 32) {
+            path[depth++] = cur;
+        } else {
+            all_unique = false;
+        }
+        auto* in = static_cast<InternalNode*>(cur);
+        const size_t idx = fast_upper_bound(in->keys.data(), in->num_keys, key);
+        cur = in->children[idx];
+        if (!cur) return false;
+    }
+
+    if (cur->refcount.load(std::memory_order_acquire) != 1) {
+        all_unique = false;
+    }
+    auto* leaf = static_cast<LeafNode*>(cur);
+    const size_t pos = fast_lower_bound(leaf->keys.data(), leaf->num_keys, key);
+    if (pos >= leaf->num_keys || leaf->keys[pos] != key) {
+        return false;
+    }
+
+    if (delta_f64 == 0.0) {
+        return true;
+    }
+
+    if (all_unique && (col < INLINE_AGG_COLS || leaf->extra != nullptr)) [[likely]] {
+        if (col < INLINE_AGG_COLS) {
+            leaf->row_f64_inline[pos][col] += delta_f64;
+        } else {
+            leaf->extra->f64[pos][col - INLINE_AGG_COLS] += delta_f64;
+        }
+        leaf->col_sum_f64[col] += delta_f64;
+        for (size_t i = depth; i > 0; --i) {
+            path[i - 1]->col_sum_f64[col] += delta_f64;
+        }
+        return true;
+    }
+
+    std::array<int64_t, MAX_AGG_COLS> i64_vals{};
+    std::array<double, MAX_AGG_COLS> f64_vals{};
+    for (size_t c = 0; c < MAX_AGG_COLS; ++c) {
+        i64_vals[c] = leaf->get_row_i64(pos, c);
+        f64_vals[c] = leaf->get_row_f64(pos, c);
+    }
+    f64_vals[col] += delta_f64;
+    NodeHeader* new_root = upsert_into_root(root, key, leaf->row_ids[pos], i64_vals, f64_vals, 0);
+    root_.store(new_root, std::memory_order_release);
+    retire_root(root);
+    return true;
 }
 
 AugmentedBTree::NodeHeader* AugmentedBTree::erase_recursive(const NodeHeader* n, int64_t key, bool& found) {
@@ -1003,7 +1383,8 @@ void AugmentedBTree::clear() {
 // ShardedAugmentedBTree
 // ----------------------------------------------------------------------------
 
-ShardedAugmentedBTree::ShardedAugmentedBTree(RcuReaper* reaper, cpp26::rcu::rcu_domain& dom) {
+ShardedAugmentedBTree::ShardedAugmentedBTree(RcuReaper* reaper, cpp26::rcu::rcu_domain& dom)
+    : domain_(dom) {
     for (size_t i = 0; i < NUM_SHARDS; ++i) {
         shards_[i] = std::make_unique<AugmentedBTree>(reaper, dom);
     }
@@ -1014,52 +1395,66 @@ bool ShardedAugmentedBTree::find(int64_t key, uint64_t& out_row_id) const {
 }
 
 uint64_t ShardedAugmentedBTree::total_count() const {
+    cpp26::rcu::scoped_read_lock guard(domain_);
     uint64_t sum = 0;
     for (size_t i = 0; i < NUM_SHARDS; ++i) {
-        sum += shards_[i]->total_count();
+        const auto* r = shards_[i]->root_.load(std::memory_order_acquire);
+        if (r) sum += r->count;
     }
     return sum;
 }
 
 int64_t ShardedAugmentedBTree::total_sum_i64(size_t col) const {
+    if (col >= MAX_AGG_COLS) return 0;
+    cpp26::rcu::scoped_read_lock guard(domain_);
     int64_t sum = 0;
     for (size_t i = 0; i < NUM_SHARDS; ++i) {
-        sum += shards_[i]->total_sum_i64(col);
+        const auto* r = shards_[i]->root_.load(std::memory_order_acquire);
+        if (r) sum += r->col_sum_i64[col];
     }
     return sum;
 }
 
 double ShardedAugmentedBTree::total_sum_f64(size_t col) const {
+    if (col >= MAX_AGG_COLS) return 0.0;
+    cpp26::rcu::scoped_read_lock guard(domain_);
     double sum = 0.0;
     for (size_t i = 0; i < NUM_SHARDS; ++i) {
-        sum += shards_[i]->total_sum_f64(col);
+        const auto* r = shards_[i]->root_.load(std::memory_order_acquire);
+        if (r) sum += r->col_sum_f64[col];
     }
     return sum;
 }
 
 uint64_t ShardedAugmentedBTree::range_count(int64_t lo, int64_t hi) const {
     if (lo > hi) return 0;
+    cpp26::rcu::scoped_read_lock guard(domain_);
     uint64_t sum = 0;
     for (size_t i = 0; i < NUM_SHARDS; ++i) {
-        sum += shards_[i]->range_count(lo, hi);
+        sum += AugmentedBTree::range_count_node(
+            shards_[i]->root_.load(std::memory_order_acquire), lo, hi);
     }
     return sum;
 }
 
 int64_t ShardedAugmentedBTree::range_sum_i64(int64_t lo, int64_t hi, size_t col) const {
     if (lo > hi || col >= MAX_AGG_COLS) return 0;
+    cpp26::rcu::scoped_read_lock guard(domain_);
     int64_t sum = 0;
     for (size_t i = 0; i < NUM_SHARDS; ++i) {
-        sum += shards_[i]->range_sum_i64(lo, hi, col);
+        sum += AugmentedBTree::range_sum_i64_node(
+            shards_[i]->root_.load(std::memory_order_acquire), lo, hi, col);
     }
     return sum;
 }
 
 double ShardedAugmentedBTree::range_sum_f64(int64_t lo, int64_t hi, size_t col) const {
     if (lo > hi || col >= MAX_AGG_COLS) return 0.0;
+    cpp26::rcu::scoped_read_lock guard(domain_);
     double sum = 0.0;
     for (size_t i = 0; i < NUM_SHARDS; ++i) {
-        sum += shards_[i]->range_sum_f64(lo, hi, col);
+        sum += AugmentedBTree::range_sum_f64_node(
+            shards_[i]->root_.load(std::memory_order_acquire), lo, hi, col);
     }
     return sum;
 }
@@ -1100,6 +1495,48 @@ void ShardedAugmentedBTree::upsert_batch(const std::vector<BatchEntry>& entries)
             shards_[i]->upsert_batch(buckets[i]);
         }
     }
+}
+
+void ShardedAugmentedBTree::upsert_batch_columnar(const int64_t* keys,
+                                                  const uint64_t* row_ids,
+                                                  const int64_t* col0_i64,
+                                                  size_t count) {
+    if (count == 0 || !keys || !row_ids) return;
+    struct ShardBucket {
+        std::vector<int64_t> keys;
+        std::vector<uint64_t> row_ids;
+        std::vector<int64_t> col0_i64;
+    };
+    std::array<ShardBucket, NUM_SHARDS> buckets;
+    const size_t approx = (count / NUM_SHARDS) + 1;
+    for (size_t i = 0; i < NUM_SHARDS; ++i) {
+        buckets[i].keys.reserve(approx);
+        buckets[i].row_ids.reserve(approx);
+        if (col0_i64) buckets[i].col0_i64.reserve(approx);
+    }
+    for (size_t i = 0; i < count; ++i) {
+        const size_t s = shard_for_key(keys[i]);
+        buckets[s].keys.push_back(keys[i]);
+        buckets[s].row_ids.push_back(row_ids[i]);
+        if (col0_i64) buckets[s].col0_i64.push_back(col0_i64[i]);
+    }
+    for (size_t i = 0; i < NUM_SHARDS; ++i) {
+        if (!buckets[i].keys.empty()) {
+            shards_[i]->upsert_batch_columnar(
+                buckets[i].keys.data(),
+                buckets[i].row_ids.data(),
+                col0_i64 ? buckets[i].col0_i64.data() : nullptr,
+                buckets[i].keys.size());
+        }
+    }
+}
+
+bool ShardedAugmentedBTree::update_existing_i64(int64_t key, size_t col, int64_t delta_i64) {
+    return shards_[shard_for_key(key)]->update_existing_i64(key, col, delta_i64);
+}
+
+bool ShardedAugmentedBTree::update_existing_f64(int64_t key, size_t col, double delta_f64) {
+    return shards_[shard_for_key(key)]->update_existing_f64(key, col, delta_f64);
 }
 
 bool ShardedAugmentedBTree::erase(int64_t key) {

@@ -11,6 +11,7 @@
 
 * Architecture & Internals
   * [Zero-Copy C-ABI](abi.md)
+  * [Security & Encryption](security.md)
   * [Postgres AST & Grammar](ast.md)
   * [C++26 Toolchain](toolchain.md)
   * [Performance & Benchmarks](performance.md)
