@@ -1,0 +1,10 @@
+[package]
+name = "zephyrdb"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-copy Rust FFI bindings for ZephyrDB"
+build = "build.rs"
+
+[lib]
+name = "zephyrdb"
+path = "src/lib.rs"
