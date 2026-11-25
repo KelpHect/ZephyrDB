@@ -352,6 +352,20 @@ int main() {
                       << std::chrono::duration<double, std::micro>(l1 - l0).count() << " us\n";
             zephyr_stmt_free(lb);
         }
+        {
+            zephyr_exec(db, "CREATE INDEX idx_items_gold ON items (gold);", nullptr);
+            ZephyrStmt* topk = zephyr_prepare(db, "SELECT id, gold FROM items ORDER BY gold DESC LIMIT 10;");
+            constexpr int T = 1000;
+            auto k0 = Clock::now();
+            for (int i = 0; i < T; ++i) {
+                ZephyrResultSet* rs = zephyr_stmt_query(topk, nullptr, 0);
+                zephyr_result_free(rs);
+            }
+            auto k1 = Clock::now();
+            std::cout << "Indexed SQL (ORDER BY gold DESC LIMIT 10): "
+                      << (std::chrono::duration<double, std::micro>(k1 - k0).count() / T) << " us\n";
+            zephyr_stmt_free(topk);
+        }
         zephyr_stmt_free(pk_ins);
         zephyr_stmt_free(pk_sel);
 

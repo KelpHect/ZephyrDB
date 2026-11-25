@@ -90,8 +90,8 @@ ParseResult Parser::parse() {
 
 std::optional<Stmt> Parser::parse_statement() {
     switch (peek().kind) {
-        case TokenKind::KwCreate: return parse_create_table();
-        case TokenKind::KwDrop:   return parse_drop_table();
+        case TokenKind::KwCreate: return parse_create();
+        case TokenKind::KwDrop:   return parse_drop();
         case TokenKind::KwInsert: return parse_insert();
         case TokenKind::KwUpdate: return parse_update();
         case TokenKind::KwDelete: return parse_delete();
@@ -161,10 +161,45 @@ std::optional<ColumnType> Parser::parse_column_type() {
     return std::nullopt;
 }
 
-std::optional<CreateTableStmt> Parser::parse_create_table() {
+std::optional<Stmt> Parser::parse_create() {
     expect(TokenKind::KwCreate, "expected CREATE");
-    if (!expect(TokenKind::KwTable, "expected TABLE")) return std::nullopt;
+    if (match(TokenKind::KwTable)) {
+        auto tbl = parse_create_table();
+        if (!tbl) return std::nullopt;
+        return Stmt{std::move(*tbl)};
+    }
+    if (match(TokenKind::KwUnique)) {
+        if (!expect(TokenKind::KwIndex, "expected INDEX after UNIQUE")) return std::nullopt;
+        auto idx = parse_create_index(true);
+        if (!idx) return std::nullopt;
+        return Stmt{std::move(*idx)};
+    }
+    if (match(TokenKind::KwIndex)) {
+        auto idx = parse_create_index(false);
+        if (!idx) return std::nullopt;
+        return Stmt{std::move(*idx)};
+    }
+    set_error("expected TABLE or INDEX after CREATE");
+    return std::nullopt;
+}
 
+std::optional<Stmt> Parser::parse_drop() {
+    expect(TokenKind::KwDrop, "expected DROP");
+    if (match(TokenKind::KwTable)) {
+        auto tbl = parse_drop_table();
+        if (!tbl) return std::nullopt;
+        return Stmt{std::move(*tbl)};
+    }
+    if (match(TokenKind::KwIndex)) {
+        auto idx = parse_drop_index();
+        if (!idx) return std::nullopt;
+        return Stmt{std::move(*idx)};
+    }
+    set_error("expected TABLE or INDEX after DROP");
+    return std::nullopt;
+}
+
+std::optional<CreateTableStmt> Parser::parse_create_table() {
     CreateTableStmt stmt;
     if (match(TokenKind::KwIf)) {
         if (!expect(TokenKind::KwNot, "expected NOT after IF")) return std::nullopt;
@@ -212,9 +247,6 @@ std::optional<CreateTableStmt> Parser::parse_create_table() {
 }
 
 std::optional<DropTableStmt> Parser::parse_drop_table() {
-    expect(TokenKind::KwDrop, "expected DROP");
-    if (!expect(TokenKind::KwTable, "expected TABLE")) return std::nullopt;
-
     DropTableStmt stmt;
     if (match(TokenKind::KwIf)) {
         if (!expect(TokenKind::KwExists, "expected EXISTS after IF")) return std::nullopt;
@@ -225,6 +257,51 @@ std::optional<DropTableStmt> Parser::parse_drop_table() {
         return std::nullopt;
     }
     stmt.table_name = extract_ident(advance());
+    return stmt;
+}
+
+std::optional<CreateIndexStmt> Parser::parse_create_index(bool unique) {
+    CreateIndexStmt stmt;
+    stmt.unique = unique;
+    if (match(TokenKind::KwIf)) {
+        if (!expect(TokenKind::KwNot, "expected NOT after IF")) return std::nullopt;
+        if (!expect(TokenKind::KwExists, "expected EXISTS after IF NOT")) return std::nullopt;
+        stmt.if_not_exists = true;
+    }
+    if (!is_ident_token(peek().kind)) {
+        set_error("expected index name");
+        return std::nullopt;
+    }
+    stmt.index_name = extract_ident(advance());
+
+    if (!expect(TokenKind::KwOn, "expected ON after index name")) return std::nullopt;
+    if (!is_ident_token(peek().kind)) {
+        set_error("expected table name");
+        return std::nullopt;
+    }
+    stmt.table_name = extract_ident(advance());
+
+    if (!expect(TokenKind::LParen, "expected '(' after table name")) return std::nullopt;
+    if (!is_ident_token(peek().kind)) {
+        set_error("expected column name");
+        return std::nullopt;
+    }
+    stmt.column_name = extract_ident(advance());
+    if (!expect(TokenKind::RParen, "expected ')' after indexed column")) return std::nullopt;
+    return stmt;
+}
+
+std::optional<DropIndexStmt> Parser::parse_drop_index() {
+    DropIndexStmt stmt;
+    if (match(TokenKind::KwIf)) {
+        if (!expect(TokenKind::KwExists, "expected EXISTS after IF")) return std::nullopt;
+        stmt.if_exists = true;
+    }
+    if (!is_ident_token(peek().kind)) {
+        set_error("expected index name");
+        return std::nullopt;
+    }
+    stmt.index_name = extract_ident(advance());
     return stmt;
 }
 

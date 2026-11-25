@@ -50,5 +50,18 @@ Measured results from `zephyrdb_bench.exe` on Windows x64 (`MSVC 19.52`, `/std:c
 | **Same-Table Sharded PK Updates** (`4` threads, 1 hot table) | **8.83 M updates/sec** | 8-way `row_shard_mu` + `pk_shard_index` (no `mu_`/`rw_mu`) |
 | **Mixed MMORPG `2R + 2W` Workload** (separate tables) | **27.43 M ops/sec** | Concurrent lock-free reads + parallel table writes |
 | **Everyday SQL: 1 `INSERT` / 50 `INSERT`s** (prepared) | **13.50 µs** / **62.70 µs** | ~1.25 µs/row steady-state |
-| **Everyday SQL: 1 PK `SELECT` / 50 PK `SELECT`s** (10k rows) | **0.08 µs** / **4.10 µs** | O(1) `CompiledPkSelectPlan` fastpath |
-| **Everyday SQL: `JOIN + ORDER BY LIMIT 10`** | **1,868.70 µs** (`1.87 ms`) | Hash join + sort over 10k × 1k rows |
+| **Everyday SQL: 1 PK `SELECT` / 50 PK `SELECT`s** (10k rows) | **0.08–0.11 µs** / **4.10–5.46 µs** | O(1) `CompiledPkSelectPlan` fastpath |
+| **Indexed SQL: `ORDER BY gold DESC LIMIT 10`** (10k rows) | **1.26 µs** | Opt-in `CREATE INDEX` (`O(log N + K)`) |
+| **Everyday SQL: `JOIN + ORDER BY LIMIT 10`** | **1,868.70 µs** (`1.87 ms`) | Index nested-loop + Top-K `partial_sort` |
+
+### Head-to-Head vs. SQLite (`node benchmarks/compare_sqlite.mjs`)
+
+Measured on Node v26.13.0 (`node:sqlite` WAL mode) vs. ZephyrDB C-ABI on the same machine:
+
+| Query (10k rows) | SQLite (`:memory:`) | SQLite (`WAL`) | ZephyrDB (`C-ABI`) |
+| :--- | :--- | :--- | :--- |
+| **1 PK `SELECT`** | `1.34 µs` | `3.12 µs` | **`0.18 µs`** |
+| **50 PK `SELECT`s** | `51.52 µs` | `231.29 µs` | **`9.13 µs`** |
+| **`SELECT COUNT(*), SUM(gold)`** | `299.00 µs` | `482.53 µs` | **`0.10 µs`** |
+| **1 `INSERT` (prepared)** | `30.80 µs` | `67.90 µs` | **`12.70 µs`** |
+| **50 `INSERT`s (prepared)** | `68.10 µs` | `2.18 ms` | **`78.00 µs`** |

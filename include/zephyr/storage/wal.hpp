@@ -40,6 +40,7 @@ public:
     bool try_pop(Slot& out);
     size_t pop_batch(std::vector<Slot>& out, size_t max_batch = 256);
     bool empty() const noexcept;
+    size_t size() const noexcept;
 
 private:
     std::array<Slot, CAPACITY> buffer_{};
@@ -65,6 +66,11 @@ public:
     /// Stores/derives a 32-byte AEAD key and generates a random 4-byte nonce salt.
     void set_encryption_key(const uint8_t* key32, size_t len);
     bool is_encrypted() const noexcept { return encrypted_; }
+
+    /// Configure group-commit coalescing window in microseconds (0 disables coalescing).
+    void set_group_commit_us(uint32_t us) noexcept { group_commit_us_.store(us, std::memory_order_release); }
+    uint64_t group_commit_batches() const noexcept { return group_commit_batches_.load(std::memory_order_acquire); }
+    uint64_t group_commit_records() const noexcept { return group_commit_records_.load(std::memory_order_acquire); }
 
     bool open(const std::string& wal_path, uint32_t flush_ms = 2);
     void close();
@@ -99,6 +105,9 @@ private:
 
     std::string wal_path_;
     uint32_t flush_ms_{2};
+    std::atomic<uint32_t> group_commit_us_{250};
+    std::atomic<uint64_t> group_commit_batches_{0};
+    std::atomic<uint64_t> group_commit_records_{0};
 
     WalRingBuffer ring_;
     std::mutex push_mu_;

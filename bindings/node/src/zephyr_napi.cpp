@@ -256,6 +256,40 @@ StmtHandle* unwrap_stmt(napi_env env, napi_value val) {
     return h;
 }
 
+void parse_config(napi_env env, napi_value arg, ZephyrConfig& cfg, std::string& data_dir) {
+    napi_valuetype vt = napi_undefined;
+    napi_typeof(env, arg, &vt);
+    if (vt == napi_string) {
+        data_dir = get_utf8(env, arg);
+        cfg.data_dir = data_dir.c_str();
+    } else if (vt == napi_object) {
+        bool has = false;
+        napi_has_named_property(env, arg, "dataDir", &has);
+        if (has) {
+            napi_value v{};
+            napi_get_named_property(env, arg, "dataDir", &v);
+            data_dir = get_utf8(env, v);
+            cfg.data_dir = data_dir.c_str();
+        }
+        napi_has_named_property(env, arg, "enableWal", &has);
+        if (has) {
+            napi_value v{};
+            napi_get_named_property(env, arg, "enableWal", &v);
+            bool b = true;
+            napi_get_value_bool(env, v, &b);
+            cfg.enable_wal = b ? 1 : 0;
+        }
+        napi_has_named_property(env, arg, "enableCompactor", &has);
+        if (has) {
+            napi_value v{};
+            napi_get_named_property(env, arg, "enableCompactor", &v);
+            bool b = true;
+            napi_get_value_bool(env, v, &b);
+            cfg.enable_compactor = b ? 1 : 0;
+        }
+    }
+}
+
 napi_value napi_open(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1]{};
@@ -264,42 +298,44 @@ napi_value napi_open(napi_env env, napi_callback_info info) {
     ZephyrConfig cfg = zephyr_default_config();
     std::string data_dir;
     if (argc >= 1) {
-        napi_valuetype vt = napi_undefined;
-        napi_typeof(env, args[0], &vt);
-        if (vt == napi_string) {
-            data_dir = get_utf8(env, args[0]);
-            cfg.data_dir = data_dir.c_str();
-        } else if (vt == napi_object) {
-            bool has = false;
-            napi_has_named_property(env, args[0], "dataDir", &has);
-            if (has) {
-                napi_value v{};
-                napi_get_named_property(env, args[0], "dataDir", &v);
-                data_dir = get_utf8(env, v);
-                cfg.data_dir = data_dir.c_str();
-            }
-            napi_has_named_property(env, args[0], "enableWal", &has);
-            if (has) {
-                napi_value v{};
-                napi_get_named_property(env, args[0], "enableWal", &v);
-                bool b = true;
-                napi_get_value_bool(env, v, &b);
-                cfg.enable_wal = b ? 1 : 0;
-            }
-            napi_has_named_property(env, args[0], "enableCompactor", &has);
-            if (has) {
-                napi_value v{};
-                napi_get_named_property(env, args[0], "enableCompactor", &v);
-                bool b = true;
-                napi_get_value_bool(env, v, &b);
-                cfg.enable_compactor = b ? 1 : 0;
-            }
-        }
+        parse_config(env, args[0], cfg, data_dir);
     }
 
     ZephyrDB* db = zephyr_db_open(&cfg);
     if (!db) {
         return throw_err(env, "Failed to open ZephyrDB");
+    }
+    auto* h = new DbHandle{db};
+    napi_value ext{};
+    napi_create_external(env, h, db_finalizer, nullptr, &ext);
+    return ext;
+}
+
+napi_value napi_open_encrypted(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2]{};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 2) return throw_err(env, "Expected (config, keyBuffer)");
+
+    ZephyrConfig cfg = zephyr_default_config();
+    std::string data_dir;
+    parse_config(env, args[0], cfg, data_dir);
+
+    bool is_buf = false;
+    napi_is_buffer(env, args[1], &is_buf);
+    if (!is_buf) {
+        return throw_err(env, "Expected keyBuffer to be a Buffer");
+    }
+    void* key_data = nullptr;
+    size_t key_len = 0;
+    napi_get_buffer_info(env, args[1], &key_data, &key_len);
+
+    ZephyrDB* db = zephyr_db_open_encrypted(
+        &cfg,
+        static_cast<const uint8_t*>(key_data),
+        static_cast<uint32_t>(key_len));
+    if (!db) {
+        return throw_err(env, "Failed to open encrypted ZephyrDB");
     }
     auto* h = new DbHandle{db};
     napi_value ext{};
@@ -326,7 +362,9 @@ napi_value napi_close(napi_env env, napi_callback_info info) {
     return undef;
 }
 
-napi_value napi_exec_fn(napi_env env, napi_callback_info info) {
+using ExecCAbiFn = int32_t (*)(ZephyrDB*, const char*, uint64_t*);
+
+napi_value exec_impl(napi_env env, napi_callback_info info, ExecCAbiFn fn) {
     size_t argc = 2;
     napi_value args[2]{};
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -336,13 +374,21 @@ napi_value napi_exec_fn(napi_env env, napi_callback_info info) {
     if (!h) return nullptr;
     std::string sql = get_utf8(env, args[1]);
     uint64_t rows_affected = 0;
-    int32_t st = zephyr_exec(h->db, sql.c_str(), &rows_affected);
+    int32_t st = fn(h->db, sql.c_str(), &rows_affected);
     if (st != ZEPHYR_OK) {
         return throw_err(env, zephyr_last_error(h->db));
     }
     napi_value out{};
     napi_create_int64(env, static_cast<int64_t>(rows_affected), &out);
     return out;
+}
+
+napi_value napi_exec_fn(napi_env env, napi_callback_info info) {
+    return exec_impl(env, info, zephyr_exec);
+}
+
+napi_value napi_exec_sync_fn(napi_env env, napi_callback_info info) {
+    return exec_impl(env, info, zephyr_exec_sync);
 }
 
 napi_value napi_query_fn(napi_env env, napi_callback_info info) {
@@ -521,11 +567,42 @@ napi_value napi_checkpoint_fn(napi_env env, napi_callback_info info) {
     return out;
 }
 
+napi_value napi_get_stats_fn(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1]{};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1) return throw_err(env, "Expected db handle");
+
+    DbHandle* h = unwrap_db(env, args[0]);
+    if (!h) return nullptr;
+    ZephyrStats st = zephyr_get_stats(h->db);
+
+    napi_value out{};
+    napi_create_object(env, &out);
+
+    auto set_u64 = [&](const char* key, uint64_t val) {
+        napi_value nv{};
+        napi_create_int64(env, static_cast<int64_t>(val), &nv);
+        napi_set_named_property(env, out, key, nv);
+    };
+    set_u64("tableCount", st.table_count);
+    set_u64("totalRows", st.total_rows);
+    set_u64("walLsn", st.wal_lsn);
+    set_u64("walFlushedLsn", st.wal_flushed_lsn);
+    set_u64("rcuReclaimed", st.rcu_reclaimed);
+    set_u64("o1FastpathHits", st.o1_fastpath_hits);
+    set_u64("preparedQueries", st.prepared_queries);
+    set_u64("activeTxns", st.active_txns);
+    return out;
+}
+
 napi_value Init(napi_env env, napi_value exports) {
     napi_property_descriptor props[] = {
         {"open", nullptr, napi_open, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"openEncrypted", nullptr, napi_open_encrypted, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"close", nullptr, napi_close, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"exec", nullptr, napi_exec_fn, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"execSync", nullptr, napi_exec_sync_fn, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"query", nullptr, napi_query_fn, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"prepare", nullptr, napi_prepare_fn, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"stmtQuery", nullptr, napi_stmt_query_fn, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -533,6 +610,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"aggregateCount", nullptr, napi_aggregate_count_fn, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"aggregateSum", nullptr, napi_aggregate_sum_fn, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"checkpoint", nullptr, napi_checkpoint_fn, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"getStats", nullptr, napi_get_stats_fn, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props);
     return exports;

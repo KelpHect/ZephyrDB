@@ -172,6 +172,12 @@ bool WalRingBuffer::empty() const noexcept {
     return tail_.load(std::memory_order_acquire) == head_.load(std::memory_order_acquire);
 }
 
+size_t WalRingBuffer::size() const noexcept {
+    const size_t h = head_.load(std::memory_order_acquire);
+    const size_t t = tail_.load(std::memory_order_acquire);
+    return (h - t) & (CAPACITY - 1);
+}
+
 // ----------------------------------------------------------------------------
 // WalManager (WAL Guardian)
 // ----------------------------------------------------------------------------
@@ -230,6 +236,8 @@ bool WalManager::open(const std::string& wal_path, uint32_t flush_ms) {
     next_lsn_.store(max_lsn + 1, std::memory_order_release);
     flushed_lsn_.store(max_lsn, std::memory_order_release);
     synced_lsn_.store(max_lsn, std::memory_order_release);
+    group_commit_batches_.store(0, std::memory_order_release);
+    group_commit_records_.store(0, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lk(cv_mu_);
         wake_requested_ = false;
@@ -354,6 +362,18 @@ void WalManager::guardian_loop() {
 }
 
 void WalManager::drain_and_write() {
+    static constexpr size_t kGroupCommitMaxBatch = 64;
+    const uint32_t gc_us = group_commit_us_.load(std::memory_order_acquire);
+    if (gc_us > 0 && running_.load(std::memory_order_acquire)) {
+        std::unique_lock<std::mutex> lk(cv_mu_);
+        if (sync_requested_ && ring_.size() < kGroupCommitMaxBatch) {
+            wake_cv_.wait_for(lk, std::chrono::microseconds(gc_us), [this] {
+                return !running_.load(std::memory_order_acquire) ||
+                       ring_.size() >= kGroupCommitMaxBatch;
+            });
+        }
+    }
+
     std::vector<WalRingBuffer::Slot> batch;
     ring_.pop_batch(batch, WalRingBuffer::CAPACITY);
 
@@ -426,6 +446,10 @@ void WalManager::drain_and_write() {
         if (do_sync) {
             synced_lsn_.store(max_lsn, std::memory_order_release);
         }
+    }
+    if (do_sync && !batch.empty()) {
+        group_commit_batches_.fetch_add(1, std::memory_order_relaxed);
+        group_commit_records_.fetch_add(batch.size(), std::memory_order_relaxed);
     }
     flush_cv_.notify_all();
 }

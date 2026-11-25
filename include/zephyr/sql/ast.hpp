@@ -124,6 +124,19 @@ struct DropTableStmt {
     std::string table_name;
 };
 
+struct CreateIndexStmt {
+    std::string index_name;
+    std::string table_name;
+    std::string column_name;
+    bool unique{false};
+    bool if_not_exists{false};
+};
+
+struct DropIndexStmt {
+    std::string index_name;
+    bool if_exists{false};
+};
+
 struct SelectItem {
     bool is_star{false};
     std::string table_qualifier; // for t.*
@@ -205,6 +218,8 @@ struct TxnStmt {
 using Stmt = std::variant<
     CreateTableStmt,
     DropTableStmt,
+    CreateIndexStmt,
+    DropIndexStmt,
     InsertStmt,
     UpdateStmt,
     DeleteStmt,

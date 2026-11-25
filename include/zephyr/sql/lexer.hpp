@@ -41,6 +41,8 @@ enum class TokenKind : uint16_t {
     KwCreate,
     KwDrop,
     KwTable,
+    KwIndex,
+    KwUnique,
     KwIf,
     KwNot,
     KwExists,

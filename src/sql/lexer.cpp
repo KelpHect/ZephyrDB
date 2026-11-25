@@ -42,6 +42,8 @@ TokenKind lookup_keyword(std::string_view word) noexcept {
         {"CREATE", 6, TokenKind::KwCreate},
         {"DROP", 4, TokenKind::KwDrop},
         {"TABLE", 5, TokenKind::KwTable},
+        {"INDEX", 5, TokenKind::KwIndex},
+        {"UNIQUE", 6, TokenKind::KwUnique},
         {"IF", 2, TokenKind::KwIf},
         {"NOT", 3, TokenKind::KwNot},
         {"EXISTS", 6, TokenKind::KwExists},

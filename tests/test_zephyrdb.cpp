@@ -11,6 +11,7 @@
 #include "zephyr/sql/simd_eval.hpp"
 #include "zephyr/storage/crypto.hpp"
 #include "zephyr/storage/mmap_store.hpp"
+#include "zephyr/storage/tiered_store.hpp"
 #include "zephyr/storage/wal.hpp"
 
 #include <atomic>
@@ -815,6 +816,102 @@ static void test_crypto_and_encrypted_db() {
     fs::remove_all(dir);
 }
 
+static void test_group_commit_wal() {
+    std::cout << "Running test_group_commit_wal...\n";
+    fs::path dir = fs::temp_directory_path() / "zephyrdb_test_group_commit";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    std::string wal_path = (dir / "gc.wal").string();
+
+    zephyr::storage::WalManager wal;
+    wal.set_group_commit_us(400);
+    CHECK(wal.open(wal_path, 1));
+
+    std::vector<std::thread> writers;
+    for (int t = 0; t < 4; ++t) {
+        writers.emplace_back([&, t]() {
+            for (int i = 0; i < 16; ++i) {
+                std::string sql = "INSERT INTO tx VALUES (" + std::to_string(t * 100 + i) + ");";
+                uint64_t lsn = wal.append(1, sql, true);
+                CHECK(lsn > 0);
+            }
+        });
+    }
+    for (auto& w : writers) w.join();
+    CHECK(wal.group_commit_records() == 64);
+    CHECK(wal.group_commit_batches() > 0 && wal.group_commit_batches() < 64);
+    wal.close();
+
+    auto replayed = wal.replay();
+    CHECK(replayed.size() == 64);
+    fs::remove_all(dir);
+}
+
+static void test_tiered_cold_segments() {
+    std::cout << "Running test_tiered_cold_segments...\n";
+    fs::path dir = fs::temp_directory_path() / "zephyrdb_test_tiered";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    zephyr::storage::TieredStore store(dir.string());
+    std::vector<zephyr::storage::ColdRow> seg1;
+    for (int i = 100; i >= 1; --i) { // unsorted input
+        zephyr::storage::ColdRow r;
+        r.key = i;
+        r.row_id = static_cast<uint64_t>(i);
+        r.i64_cols[0] = i * 10;
+        seg1.push_back(r);
+    }
+    CHECK(store.flush_cold_segment("players", seg1, nullptr));
+
+    uint8_t enc_key[32]{};
+    for (int i = 0; i < 32; ++i) enc_key[i] = static_cast<uint8_t>(i + 1);
+    std::vector<zephyr::storage::ColdRow> seg2;
+    for (int i = 101; i <= 200; ++i) {
+        zephyr::storage::ColdRow r;
+        r.key = i;
+        r.row_id = static_cast<uint64_t>(i);
+        r.i64_cols[0] = i * 10;
+        seg2.push_back(r);
+    }
+    CHECK(store.flush_cold_segment("players", seg2, enc_key));
+    CHECK(store.segment_count("players") == 2);
+    CHECK(store.cold_total_count("players") == 200);
+    CHECK(store.cold_total_sum_i64("players", 0) == 10LL * 200 * 201 / 2);
+    CHECK(store.cold_range_sum_i64("players", 1, 100, 0) == 10LL * 100 * 101 / 2);
+
+    zephyr::storage::ColdRow found{};
+    CHECK(store.cold_find("players", 42, found, nullptr) && found.i64_cols[0] == 420);
+    CHECK(store.cold_find("players", 150, found, enc_key) && found.i64_cols[0] == 1500);
+    CHECK(!store.cold_find("players", 999, found, enc_key));
+
+    fs::remove_all(dir);
+}
+
+static void test_secondary_index_and_topk_join() {
+    std::cout << "Running test_secondary_index_and_topk_join...\n";
+    ZephyrConfig cfg = zephyr_default_config();
+    ZephyrDB* db = zephyr_db_open(&cfg);
+    CHECK(db != nullptr);
+    CHECK(zephyr_exec(db, "CREATE TABLE heroes (id BIGINT PRIMARY KEY, name TEXT, power BIGINT);", nullptr) == ZEPHYR_OK);
+    CHECK(zephyr_exec(db, "CREATE INDEX idx_power ON heroes (power);", nullptr) == ZEPHYR_OK);
+    CHECK(zephyr_exec(db, "INSERT INTO heroes VALUES (1, 'A', 50), (2, 'B', 300), (3, 'C', 150), (4, 'D', 900), (5, 'E', 250);", nullptr) == ZEPHYR_OK);
+
+    ZephyrResultSet* top = zephyr_query(db, "SELECT id, name, power FROM heroes ORDER BY power DESC LIMIT 2;");
+    CHECK(top != nullptr && top->status == ZEPHYR_OK && top->row_count == 2);
+    CHECK(top->values[0].as.i64 == 4 && top->values[2].as.i64 == 900);
+    CHECK(top->values[3].as.i64 == 2 && top->values[5].as.i64 == 300);
+    zephyr_result_free(top);
+
+    ZephyrResultSet* eq = zephyr_query(db, "SELECT name FROM heroes WHERE power = 150;");
+    CHECK(eq != nullptr && eq->status == ZEPHYR_OK && eq->row_count == 1);
+    CHECK(std::strcmp(reinterpret_cast<const char*>(eq->values[0].as.slice.ptr), "C") == 0);
+    zephyr_result_free(eq);
+
+    CHECK(zephyr_exec(db, "DROP INDEX idx_power;", nullptr) == ZEPHYR_OK);
+    zephyr_db_close(db);
+}
+
 int main() {
     test_arena();
     test_btree_and_rcu_concurrent();
@@ -824,7 +921,10 @@ int main() {
     test_prepared_and_concurrent_sql();
     test_concurrent_writes_pk_update_and_sys_tables();
     test_same_table_sharded_pk_updates();
+    test_secondary_index_and_topk_join();
     test_persistence_wal_and_mmap();
+    test_group_commit_wal();
+    test_tiered_cold_segments();
     test_crypto_and_encrypted_db();
     test_raft_cluster();
     test_pgwire_loopback();

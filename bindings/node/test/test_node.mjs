@@ -147,7 +147,24 @@ async function runTests() {
     assert.equal(aggVals[0], 3);
     assert.equal(aggVals[1], 525);
 
-    // 7. openEmbedded() graceful error when N-API binary is not compiled
+    // 7. 50-query PGWire pipeline in 1 RTT
+    const pipelineQueries = Array.from({ length: 50 }, (_, i) => ({
+      sql: 'SELECT id, player, score FROM scores WHERE id = $1;',
+      params: [(i % 3) + 1],
+    }));
+    const pipeResults = await client.pipeline(pipelineQueries);
+    assert.equal(pipeResults.length, 50);
+    const expectedPlayers = ['Alice', 'Bob', 'Carol'];
+    const expectedScores = [100, 250, 175];
+    for (let i = 0; i < 50; i++) {
+      const r = pipeResults[i];
+      assert.equal(r.rows.length, 1);
+      assert.equal(r.rows[0].id, (i % 3) + 1);
+      assert.equal(r.rows[0].player, expectedPlayers[i % 3]);
+      assert.equal(r.rows[0].score, expectedScores[i % 3]);
+    }
+
+    // 8. openEmbedded() graceful error when N-API binary is not compiled
     const napiRelease = path.resolve('build/Release/zephyr_napi.node');
     if (!fs.existsSync(napiRelease)) {
       assert.throws(() => openEmbedded({ dataDir: tmpDir }), /not built/i);

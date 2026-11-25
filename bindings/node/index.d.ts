@@ -17,10 +17,13 @@ export interface QueryResult<T = Record<string, unknown>> {
   fields: QueryField[];
 }
 
+export type PipelineQueryItem = string | { sql: string; params?: unknown[] };
+
 export class ZephyrPgClient {
   constructor(options?: ZephyrPgClientOptions);
   connect(): Promise<void>;
   query<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<QueryResult<T>>;
+  pipeline<T = Record<string, unknown>>(queries: PipelineQueryItem[]): Promise<Array<QueryResult<T>>>;
   close(): Promise<void>;
 }
 
@@ -49,14 +52,28 @@ export interface EmbeddedAggregateSum {
   sumF64: number;
 }
 
+export interface ZephyrStats {
+  tableCount: number;
+  totalRows: number;
+  walLsn: number;
+  walFlushedLsn: number;
+  rcuReclaimed: number;
+  o1FastpathHits: number;
+  preparedQueries: number;
+  activeTxns: number;
+}
+
 export interface EmbeddedDB {
   exec(sql: string): number;
+  execSync(sql: string): number;
   query<T = Record<string, unknown>>(sql: string, params?: unknown[]): EmbeddedResultSet<T>;
   prepare(sql: string): EmbeddedPreparedStmt;
   aggregateCount(table: string): number;
   aggregateSum(table: string, col: string): EmbeddedAggregateSum;
   checkpoint(): boolean;
+  getStats(): ZephyrStats;
   close(): void;
 }
 
 export function openEmbedded(config?: ZephyrEmbeddedConfig | string): EmbeddedDB;
+export function openEncrypted(config: ZephyrEmbeddedConfig | string, keyBuffer: Buffer): EmbeddedDB;

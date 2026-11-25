@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -65,6 +66,15 @@ struct ColumnData {
     void reserve(size_t n);
 };
 
+struct SecondaryIndex {
+    std::string name;
+    size_t col_idx{0};
+    ColumnType col_type{ColumnType::I64};
+    bool unique{false};
+    std::multimap<int64_t, size_t> i64_map;
+    std::multimap<std::string, size_t> str_map;
+};
+
 struct Table {
     std::string name;
     std::vector<ColumnSchema> schema;
@@ -79,6 +89,7 @@ struct Table {
     static constexpr size_t WRITE_SHARDS = 8;
     std::array<std::unordered_map<int64_t, size_t>, WRITE_SHARDS> pk_shard_index;
     std::unordered_map<std::string, size_t> pk_str_index;
+    std::vector<SecondaryIndex> indexes;
     std::unique_ptr<zephyr::core::ShardedAugmentedBTree> btree;
     mutable std::mutex write_mu;
     mutable std::shared_mutex rw_mu;
@@ -286,6 +297,8 @@ private:
                                bool sync_wal = false);
     ZephyrResultSet* exec_create_table(const CreateTableStmt& s);
     ZephyrResultSet* exec_drop_table(const DropTableStmt& s);
+    ZephyrResultSet* exec_create_index(const CreateIndexStmt& s);
+    ZephyrResultSet* exec_drop_index(const DropIndexStmt& s);
     ZephyrResultSet* exec_insert(const InsertStmt& s, const std::vector<Value>& params);
     ZephyrResultSet* exec_update(const UpdateStmt& s, const std::vector<Value>& params);
     ZephyrResultSet* exec_delete(const DeleteStmt& s, const std::vector<Value>& params);

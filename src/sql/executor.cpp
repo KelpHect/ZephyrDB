@@ -273,6 +273,85 @@ std::string value_key_string(const Value& v) {
     return "";
 }
 
+std::string secondary_index_str_key(ColumnType ty, const Value& v) {
+    if (ty == ColumnType::Text || ty == ColumnType::Bytea) {
+        return v.str;
+    }
+    return value_key_string(v);
+}
+
+std::string secondary_index_str_key_at(ColumnType ty, const ColumnData& cdata, size_t row_idx) {
+    if (ty == ColumnType::Text || ty == ColumnType::Bytea) {
+        return cdata.str_data[row_idx];
+    }
+    return value_key_string(cdata.get_value(row_idx));
+}
+
+bool secondary_index_check_unique(const SecondaryIndex& idx, const Value& v, const size_t* ignore_row = nullptr) {
+    if (!idx.unique || v.is_null()) return true;
+    if (idx.col_type == ColumnType::I64) {
+        auto [b, e] = idx.i64_map.equal_range(v.i64);
+        for (auto it = b; it != e; ++it) {
+            if (!ignore_row || it->second != *ignore_row) return false;
+        }
+        return true;
+    }
+    std::string k = secondary_index_str_key(idx.col_type, v);
+    auto [b, e] = idx.str_map.equal_range(k);
+    for (auto it = b; it != e; ++it) {
+        if (!ignore_row || it->second != *ignore_row) return false;
+    }
+    return true;
+}
+
+void secondary_index_insert(SecondaryIndex& idx, const Value& v, size_t row_idx) {
+    if (v.is_null()) return;
+    if (idx.col_type == ColumnType::I64) {
+        idx.i64_map.emplace(v.i64, row_idx);
+    } else {
+        idx.str_map.emplace(secondary_index_str_key(idx.col_type, v), row_idx);
+    }
+}
+
+void secondary_index_erase(SecondaryIndex& idx, const ColumnData& cdata, size_t row_idx) {
+    if (cdata.nulls[row_idx]) return;
+    if (idx.col_type == ColumnType::I64) {
+        auto [b, e] = idx.i64_map.equal_range(cdata.i64_data[row_idx]);
+        for (auto it = b; it != e; ++it) {
+            if (it->second == row_idx) {
+                idx.i64_map.erase(it);
+                return;
+            }
+        }
+    } else {
+        std::string k = secondary_index_str_key_at(idx.col_type, cdata, row_idx);
+        auto [b, e] = idx.str_map.equal_range(k);
+        for (auto it = b; it != e; ++it) {
+            if (it->second == row_idx) {
+                idx.str_map.erase(it);
+                return;
+            }
+        }
+    }
+}
+
+bool secondary_index_populate(SecondaryIndex& idx, const Table& tbl) {
+    const ColumnData& cdata = tbl.columns[idx.col_idx];
+    for (size_t r = 0; r < tbl.live.size(); ++r) {
+        if (!tbl.live[r] || cdata.nulls[r]) continue;
+        if (idx.col_type == ColumnType::I64) {
+            int64_t k = cdata.i64_data[r];
+            if (idx.unique && idx.i64_map.count(k) > 0) return false;
+            idx.i64_map.emplace(k, r);
+        } else {
+            std::string k = secondary_index_str_key_at(idx.col_type, cdata, r);
+            if (idx.unique && idx.str_map.count(k) > 0) return false;
+            idx.str_map.emplace(std::move(k), r);
+        }
+    }
+    return true;
+}
+
 bool is_virtual_system_table(std::string_view lower_name) noexcept {
     return lower_name == "information_schema.tables" ||
            lower_name == "information_schema.columns" ||
@@ -516,6 +595,7 @@ std::unique_ptr<Table> Table::clone_data(zephyr::core::RcuReaper* reaper) const 
     copy->next_row_id = next_row_id;
     copy->pk_shard_index = pk_shard_index;
     copy->pk_str_index = pk_str_index;
+    copy->indexes = indexes;
     copy->btree = std::make_unique<zephyr::core::ShardedAugmentedBTree>(reaper);
     return copy;
 }
@@ -1241,6 +1321,13 @@ bool ZephyrEngine::try_exec_pk_update_plan(
             if (in_txn_.load(std::memory_order_acquire)) {
                 return false;
             }
+            if (!tbl->indexes.empty()) {
+                for (const auto& idx : tbl->indexes) {
+                    if (idx.col_idx == static_cast<size_t>(target_cidx)) {
+                        return false;
+                    }
+                }
+            }
 
             auto pit = tbl->pk_shard_index[shard].find(pk_val);
             if (pit == tbl->pk_shard_index[shard].end()) {
@@ -1354,6 +1441,14 @@ bool ZephyrEngine::try_exec_pk_update_plan(
     std::lock_guard<std::mutex> tbl_lk(tbl->write_mu);
     std::unique_lock<std::shared_mutex> row_lk(tbl->rw_mu);
     AllShardsLock shards_lk(*tbl);
+
+    if (!tbl->indexes.empty()) {
+        for (const auto& idx : tbl->indexes) {
+            if (idx.col_idx == static_cast<size_t>(target_cidx)) {
+                return false;
+            }
+        }
+    }
 
     const size_t shard = zephyr::core::ShardedAugmentedBTree::shard_for_key(pk_val);
     auto pit = tbl->pk_shard_index[shard].find(pk_val);
@@ -1505,6 +1600,16 @@ bool ZephyrEngine::try_exec_pk_insert_plan(
         }
     }
 
+    if (!tbl->indexes.empty()) {
+        for (const auto& idx : tbl->indexes) {
+            if (!secondary_index_check_unique(idx, full_row[idx.col_idx])) {
+                set_error("duplicate key violates unique index: " + idx.name);
+                out_status = ZEPHYR_ERR_CONSTRAINT;
+                return true;
+            }
+        }
+    }
+
     const size_t row_idx = tbl->live.size();
     for (size_t c = 0; c < ncols; ++c) {
         tbl->columns[c].push_value(full_row[c]);
@@ -1518,6 +1623,11 @@ bool ZephyrEngine::try_exec_pk_insert_plan(
             tbl->pk_shard_index[shard][pk_val.i64] = row_idx;
         } else {
             tbl->pk_str_index[value_key_string(pk_val)] = row_idx;
+        }
+    }
+    if (!tbl->indexes.empty()) {
+        for (auto& idx : tbl->indexes) {
+            secondary_index_insert(idx, full_row[idx.col_idx], row_idx);
         }
     }
     update_btree_for_row(*tbl, row_idx);
@@ -2322,6 +2432,14 @@ ZephyrResultSet* ZephyrEngine::exec_stmt(
             auto* r = exec_drop_table(s);
             if (r->status == ZEPHYR_OK && log_wal) log_wal_entry(raw_sql, sync_wal);
             return r;
+        } else if constexpr (std::is_same_v<T, CreateIndexStmt>) {
+            auto* r = exec_create_index(s);
+            if (r->status == ZEPHYR_OK && log_wal) log_wal_entry(raw_sql, sync_wal);
+            return r;
+        } else if constexpr (std::is_same_v<T, DropIndexStmt>) {
+            auto* r = exec_drop_index(s);
+            if (r->status == ZEPHYR_OK && log_wal) log_wal_entry(raw_sql, sync_wal);
+            return r;
         } else if constexpr (std::is_same_v<T, InsertStmt>) {
             auto* r = exec_insert(s, params);
             if (r->status == ZEPHYR_OK && log_wal && params.empty()) log_wal_entry(raw_sql, sync_wal);
@@ -2459,6 +2577,66 @@ ZephyrResultSet* ZephyrEngine::exec_drop_table(const DropTableStmt& s) {
     return pack_result({}, {}, {}, 0, 0);
 }
 
+ZephyrResultSet* ZephyrEngine::exec_create_index(const CreateIndexStmt& s) {
+    std::string idx_lower = to_lower(s.index_name);
+    for (const auto& [tkey, tbl] : tables_) {
+        for (const auto& existing : tbl->indexes) {
+            if (to_lower(existing.name) == idx_lower) {
+                if (s.if_not_exists) {
+                    return pack_result({}, {}, {}, 0, 0);
+                }
+                return make_error_result(ZEPHYR_ERR_CONSTRAINT, "index already exists: " + s.index_name);
+            }
+        }
+    }
+
+    auto it = tables_.find(to_lower(s.table_name));
+    if (it == tables_.end()) {
+        return make_error_result(ZEPHYR_ERR_NOT_FOUND, "table not found: " + s.table_name);
+    }
+    Table& tbl = *it->second;
+    int col_idx = tbl.find_col(s.column_name);
+    if (col_idx < 0) {
+        return make_error_result(ZEPHYR_ERR_NOT_FOUND, "unknown column: " + s.column_name);
+    }
+
+    std::lock_guard<std::mutex> tbl_lk(tbl.write_mu);
+    std::unique_lock<std::shared_mutex> row_lk(tbl.rw_mu);
+    AllShardsLock shards_lk(tbl);
+
+    SecondaryIndex idx;
+    idx.name = s.index_name;
+    idx.col_idx = static_cast<size_t>(col_idx);
+    idx.col_type = tbl.schema[col_idx].type;
+    idx.unique = s.unique;
+
+    if (!secondary_index_populate(idx, tbl)) {
+        return make_error_result(ZEPHYR_ERR_CONSTRAINT, "duplicate key violates unique index: " + s.index_name);
+    }
+
+    tbl.indexes.push_back(std::move(idx));
+    return pack_result({}, {}, {}, 0, 0);
+}
+
+ZephyrResultSet* ZephyrEngine::exec_drop_index(const DropIndexStmt& s) {
+    std::string idx_lower = to_lower(s.index_name);
+    for (auto& [tkey, tbl] : tables_) {
+        for (size_t i = 0; i < tbl->indexes.size(); ++i) {
+            if (to_lower(tbl->indexes[i].name) == idx_lower) {
+                std::lock_guard<std::mutex> tbl_lk(tbl->write_mu);
+                std::unique_lock<std::shared_mutex> row_lk(tbl->rw_mu);
+                AllShardsLock shards_lk(*tbl);
+                tbl->indexes.erase(tbl->indexes.begin() + static_cast<ptrdiff_t>(i));
+                return pack_result({}, {}, {}, 0, 0);
+            }
+        }
+    }
+    if (s.if_exists) {
+        return pack_result({}, {}, {}, 0, 0);
+    }
+    return make_error_result(ZEPHYR_ERR_NOT_FOUND, "index not found: " + s.index_name);
+}
+
 void ZephyrEngine::update_btree_for_row(Table& tbl, size_t row_idx) {
     std::array<int64_t, zephyr::core::AugmentedBTree::MAX_AGG_COLS> i64_vals{};
     std::array<double, zephyr::core::AugmentedBTree::MAX_AGG_COLS> f64_vals{};
@@ -2548,6 +2726,15 @@ ZephyrResultSet* ZephyrEngine::exec_insert(const InsertStmt& s, const std::vecto
             }
         }
 
+        if (!tbl.indexes.empty()) {
+            for (const auto& idx : tbl.indexes) {
+                if (!secondary_index_check_unique(idx, full_row[idx.col_idx])) {
+                    return make_error_result(
+                        ZEPHYR_ERR_CONSTRAINT, "duplicate key violates unique index: " + idx.name);
+                }
+            }
+        }
+
         size_t row_idx = tbl.live.size();
         for (size_t c = 0; c < tbl.schema.size(); ++c) {
             tbl.columns[c].push_value(full_row[c]);
@@ -2561,6 +2748,11 @@ ZephyrResultSet* ZephyrEngine::exec_insert(const InsertStmt& s, const std::vecto
                 tbl.pk_shard_index[shard][pk_val.i64] = row_idx;
             } else {
                 tbl.pk_str_index[value_key_string(pk_val)] = row_idx;
+            }
+        }
+        if (!tbl.indexes.empty()) {
+            for (auto& idx : tbl.indexes) {
+                secondary_index_insert(idx, full_row[idx.col_idx], row_idx);
             }
         }
         update_btree_for_row(tbl, row_idx);
@@ -2611,6 +2803,73 @@ std::vector<uint32_t> ZephyrEngine::scan_matching_rows(
     const Expr* where,
     const std::vector<Value>& params
 ) {
+    // PK & Secondary Index point lookup fastpath: WHERE col = literal|$param
+    if (where && std::holds_alternative<BinaryExpr>(where->node)) {
+        const auto& bin = std::get<BinaryExpr>(where->node);
+        if (bin.op == BinaryOp::Eq) {
+            const ColumnRefExpr* col_ref = nullptr;
+            const Expr* rhs_expr = nullptr;
+            if (std::holds_alternative<ColumnRefExpr>(bin.left->node) &&
+                (std::holds_alternative<LiteralExpr>(bin.right->node) ||
+                 std::holds_alternative<ParamExpr>(bin.right->node))) {
+                col_ref = &std::get<ColumnRefExpr>(bin.left->node);
+                rhs_expr = bin.right.get();
+            } else if (std::holds_alternative<ColumnRefExpr>(bin.right->node) &&
+                       (std::holds_alternative<LiteralExpr>(bin.left->node) ||
+                        std::holds_alternative<ParamExpr>(bin.left->node))) {
+                col_ref = &std::get<ColumnRefExpr>(bin.right->node);
+                rhs_expr = bin.left.get();
+            }
+            if (col_ref && rhs_expr) {
+                int col_idx = tbl.find_col(col_ref->column);
+                if (col_idx >= 0) {
+                    if (col_idx == tbl.pk_col && tbl.pk_is_i64) {
+                        EvalContext empty_ctx{nullptr, nullptr, nullptr, &params};
+                        Value rhs_val = eval_expr(*rhs_expr, empty_ctx);
+                        if (rhs_val.is_null()) return {};
+                        if (rhs_val.type == ColumnType::I64) {
+                            uint64_t rid = 0;
+                            if (tbl.btree->find(rhs_val.i64, rid)) {
+                                return {static_cast<uint32_t>(rid)};
+                            }
+                            return {};
+                        }
+                    } else if (!tbl.indexes.empty()) {
+                        for (const auto& idx : tbl.indexes) {
+                            if (idx.col_idx == static_cast<size_t>(col_idx)) {
+                                EvalContext empty_ctx{nullptr, nullptr, nullptr, &params};
+                                Value rhs_val = eval_expr(*rhs_expr, empty_ctx);
+                                if (rhs_val.is_null()) return {};
+                                if (idx.col_type == ColumnType::I64 && rhs_val.type == ColumnType::I64) {
+                                    std::vector<uint32_t> out;
+                                    auto [b, e] = idx.i64_map.equal_range(rhs_val.i64);
+                                    for (auto it = b; it != e; ++it) {
+                                        if (tbl.live[it->second]) {
+                                            out.push_back(static_cast<uint32_t>(it->second));
+                                        }
+                                    }
+                                    return out;
+                                }
+                                if ((idx.col_type == ColumnType::Text || idx.col_type == ColumnType::Bytea) &&
+                                    (rhs_val.type == ColumnType::Text || rhs_val.type == ColumnType::Bytea)) {
+                                    std::vector<uint32_t> out;
+                                    auto [b, e] = idx.str_map.equal_range(rhs_val.str);
+                                    for (auto it = b; it != e; ++it) {
+                                        if (tbl.live[it->second]) {
+                                            out.push_back(static_cast<uint32_t>(it->second));
+                                        }
+                                    }
+                                    return out;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Fast SIMD path for simple `col <op> literal/param` on I64 or F64 columns
     if (where && std::holds_alternative<BinaryExpr>(where->node)) {
         const auto& bin = std::get<BinaryExpr>(where->node);
@@ -2656,35 +2915,6 @@ std::vector<uint32_t> ZephyrEngine::scan_matching_rows(
                         return filter_column_f64(
                             cdata.f64_data.data(), cdata.f64_data.size(), v, *cmp,
                             cdata.nulls.data(), tbl.live.data());
-                    }
-                }
-            }
-        }
-    }
-
-    // PK point lookup fastpath: WHERE pk = literal/param
-    if (where && tbl.pk_col >= 0 && std::holds_alternative<BinaryExpr>(where->node)) {
-        const auto& bin = std::get<BinaryExpr>(where->node);
-        if (bin.op == BinaryOp::Eq) {
-            const ColumnRefExpr* col_ref = nullptr;
-            const Expr* rhs_expr = nullptr;
-            if (std::holds_alternative<ColumnRefExpr>(bin.left->node)) {
-                col_ref = &std::get<ColumnRefExpr>(bin.left->node);
-                rhs_expr = bin.right.get();
-            } else if (std::holds_alternative<ColumnRefExpr>(bin.right->node)) {
-                col_ref = &std::get<ColumnRefExpr>(bin.right->node);
-                rhs_expr = bin.left.get();
-            }
-            if (col_ref && rhs_expr && tbl.find_col(col_ref->column) == tbl.pk_col) {
-                EvalContext empty_ctx{nullptr, nullptr, nullptr, &params};
-                Value rhs_val = eval_expr(*rhs_expr, empty_ctx);
-                if (!rhs_val.is_null()) {
-                    if (tbl.pk_is_i64 && rhs_val.type == ColumnType::I64) {
-                        uint64_t rid = 0;
-                        if (tbl.btree->find(rhs_val.i64, rid)) {
-                            return {static_cast<uint32_t>(rid)};
-                        }
-                        return {};
                     }
                 }
             }
@@ -2754,6 +2984,15 @@ ZephyrResultSet* ZephyrEngine::exec_update(const UpdateStmt& s, const std::vecto
             if (tbl.schema[cidx].not_null && coerced.is_null()) {
                 return make_error_result(ZEPHYR_ERR_CONSTRAINT, "NULL violates NOT NULL");
             }
+            if (!tbl.indexes.empty()) {
+                size_t row_sz = static_cast<size_t>(r);
+                for (const auto& idx : tbl.indexes) {
+                    if (idx.col_idx == cidx && !secondary_index_check_unique(idx, coerced, &row_sz)) {
+                        return make_error_result(
+                            ZEPHYR_ERR_CONSTRAINT, "duplicate key violates unique index: " + idx.name);
+                    }
+                }
+            }
             if (static_cast<int>(cidx) == tbl.pk_col) {
                 if (tbl.pk_is_i64) {
                     int64_t old_pk = tbl.columns[cidx].i64_data[r];
@@ -2765,6 +3004,14 @@ ZephyrResultSet* ZephyrEngine::exec_update(const UpdateStmt& s, const std::vecto
                 } else {
                     tbl.pk_str_index.erase(value_key_string(tbl.columns[cidx].get_value(r)));
                     tbl.pk_str_index[value_key_string(coerced)] = r;
+                }
+            }
+            if (!tbl.indexes.empty()) {
+                for (auto& idx : tbl.indexes) {
+                    if (idx.col_idx == cidx) {
+                        secondary_index_erase(idx, tbl.columns[cidx], r);
+                        secondary_index_insert(idx, coerced, r);
+                    }
                 }
             }
             tbl.columns[cidx].set_value(r, coerced);
@@ -2844,6 +3091,11 @@ ZephyrResultSet* ZephyrEngine::exec_delete(const DeleteStmt& s, const std::vecto
             }
         } else {
             tbl.btree->erase(static_cast<int64_t>(r + 1));
+        }
+        if (!tbl.indexes.empty()) {
+            for (auto& idx : tbl.indexes) {
+                secondary_index_erase(idx, tbl.columns[idx.col_idx], r);
+            }
         }
         tbl.live[r] = 0;
     }
@@ -3118,8 +3370,9 @@ ZephyrResultSet* ZephyrEngine::exec_select(
     }
 
     // 2.5 Direct-to-Arena Fast Projection for simple single-table SELECT
+    // (also handles ORDER BY indexed_col [ASC|DESC] LIMIT K [OFFSET O] when no WHERE)
     if (cte_map.empty() && s.from.has_value() && s.joins.empty() &&
-        s.group_by.empty() && !s.distinct && s.order_by.empty() && !s.items.empty()) {
+        s.group_by.empty() && !s.distinct && !s.items.empty()) {
         Table* base = resolve_table(s.from->table_name, nullptr);
         if (!base) {
             return make_error_result(ZEPHYR_ERR_NOT_FOUND, "table not found: " + s.from->table_name);
@@ -3127,49 +3380,105 @@ ZephyrResultSet* ZephyrEngine::exec_select(
         std::string base_qual = s.from->alias.empty() ? base->name : s.from->alias;
         std::string base_qual_lower = to_lower(base_qual);
 
-        bool can_fast_project = true;
+        const SecondaryIndex* order_idx = nullptr;
+        bool order_desc = false;
+        bool order_ok = s.order_by.empty();
+        if (!order_ok && !s.where && s.order_by.size() == 1 &&
+            s.limit.has_value() && *s.limit >= 0 && !base->indexes.empty() &&
+            s.order_by[0].expr && std::holds_alternative<ColumnRefExpr>(s.order_by[0].expr->node)) {
+            const auto& ob_cref = std::get<ColumnRefExpr>(s.order_by[0].expr->node);
+            if (ob_cref.table.empty() || to_lower(ob_cref.table) == base_qual_lower) {
+                int ob_cidx = base->find_col(ob_cref.column);
+                if (ob_cidx >= 0) {
+                    for (const auto& idx : base->indexes) {
+                        if (idx.col_idx == static_cast<size_t>(ob_cidx) &&
+                            idx.col_type == ColumnType::I64) {
+                            order_idx = &idx;
+                            order_desc = s.order_by[0].desc;
+                            order_ok = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        bool can_fast_project = order_ok;
         std::vector<int> proj_cols;
         std::vector<std::string> fast_names;
         std::vector<ColumnType> fast_types;
 
-        for (size_t i = 0; i < s.items.size(); ++i) {
-            const auto& item = s.items[i];
-            if (item.is_star) {
-                if (!item.table_qualifier.empty() && to_lower(item.table_qualifier) != base_qual_lower) {
-                    continue;
+        if (can_fast_project) {
+            for (size_t i = 0; i < s.items.size(); ++i) {
+                const auto& item = s.items[i];
+                if (item.is_star) {
+                    if (!item.table_qualifier.empty() && to_lower(item.table_qualifier) != base_qual_lower) {
+                        continue;
+                    }
+                    for (size_t c = 0; c < base->schema.size(); ++c) {
+                        proj_cols.push_back(static_cast<int>(c));
+                        fast_names.push_back(base->schema[c].name);
+                        fast_types.push_back(base->schema[c].type);
+                    }
+                } else if (item.expr && std::holds_alternative<ColumnRefExpr>(item.expr->node)) {
+                    const auto& cref = std::get<ColumnRefExpr>(item.expr->node);
+                    int cidx = -1;
+                    if (cref.table.empty() || to_lower(cref.table) == base_qual_lower) {
+                        cidx = base->find_col(cref.column);
+                    }
+                    proj_cols.push_back(cidx);
+                    fast_names.push_back(item.alias.empty() ? cref.column : item.alias);
+                    fast_types.push_back(cidx >= 0 ? base->schema[cidx].type : ColumnType::Null);
+                } else {
+                    can_fast_project = false;
+                    break;
                 }
-                for (size_t c = 0; c < base->schema.size(); ++c) {
-                    proj_cols.push_back(static_cast<int>(c));
-                    fast_names.push_back(base->schema[c].name);
-                    fast_types.push_back(base->schema[c].type);
-                }
-            } else if (item.expr && std::holds_alternative<ColumnRefExpr>(item.expr->node)) {
-                const auto& cref = std::get<ColumnRefExpr>(item.expr->node);
-                int cidx = -1;
-                if (cref.table.empty() || to_lower(cref.table) == base_qual_lower) {
-                    cidx = base->find_col(cref.column);
-                }
-                proj_cols.push_back(cidx);
-                fast_names.push_back(item.alias.empty() ? cref.column : item.alias);
-                fast_types.push_back(cidx >= 0 ? base->schema[cidx].type : ColumnType::Null);
-            } else {
-                can_fast_project = false;
-                break;
             }
         }
 
         if (can_fast_project) {
             std::shared_lock<std::shared_mutex> row_lk(base->rw_mu);
-            auto matched = scan_matching_rows(*base, s.where.get(), params);
+            std::vector<uint32_t> matched;
             size_t start_idx = 0;
-            if (s.offset.has_value() && *s.offset > 0) {
-                start_idx = std::min(matched.size(), static_cast<size_t>(*s.offset));
+            size_t row_count = 0;
+            if (order_idx) {
+                size_t off = (s.offset.has_value() && *s.offset > 0) ? static_cast<size_t>(*s.offset) : 0;
+                size_t lim = static_cast<size_t>(*s.limit);
+                matched.reserve(lim);
+                size_t skipped = 0;
+                auto collect = [&](size_t r_idx) -> bool {
+                    if (!base->live[r_idx]) return false;
+                    if (skipped < off) {
+                        ++skipped;
+                        return false;
+                    }
+                    matched.push_back(static_cast<uint32_t>(r_idx));
+                    return matched.size() >= lim;
+                };
+                if (lim > 0) {
+                    if (!order_desc) {
+                        for (auto it = order_idx->i64_map.begin(); it != order_idx->i64_map.end(); ++it) {
+                            if (collect(it->second)) break;
+                        }
+                    } else {
+                        for (auto it = order_idx->i64_map.rbegin(); it != order_idx->i64_map.rend(); ++it) {
+                            if (collect(it->second)) break;
+                        }
+                    }
+                }
+                start_idx = 0;
+                row_count = matched.size();
+            } else {
+                matched = scan_matching_rows(*base, s.where.get(), params);
+                if (s.offset.has_value() && *s.offset > 0) {
+                    start_idx = std::min(matched.size(), static_cast<size_t>(*s.offset));
+                }
+                size_t end_idx = matched.size();
+                if (s.limit.has_value() && *s.limit >= 0) {
+                    end_idx = std::min(end_idx, start_idx + static_cast<size_t>(*s.limit));
+                }
+                row_count = end_idx - start_idx;
             }
-            size_t end_idx = matched.size();
-            if (s.limit.has_value() && *s.limit >= 0) {
-                end_idx = std::min(end_idx, start_idx + static_cast<size_t>(*s.limit));
-            }
-            size_t row_count = end_idx - start_idx;
             size_t col_count = fast_names.size();
 
             auto* arena = acquire_arena(static_cast<size_t>(config_.arena_slab_bytes));
@@ -3234,7 +3543,7 @@ ZephyrResultSet* ZephyrEngine::exec_select(
                                 zv.as.slice.reserved = 0;
                                 zv.as.slice.ptr = sv.empty()
                                     ? reinterpret_cast<const uint8_t*>("")
-                                    : arena->dup_bytes(sv.data(), sv.size());
+                                    : reinterpret_cast<const uint8_t*>(arena->dup_cstr(sv));
                                 break;
                             }
                             case ColumnType::Bytea: {
@@ -3376,7 +3685,30 @@ ZephyrResultSet* ZephyrEngine::exec_select(
                 }
 
                 std::vector<std::vector<Value>> joined_rows;
-                if (left_join_col >= 0 && right_join_col >= 0) {
+                if (jc.type == JoinType::Inner && left_join_col >= 0 && right_join_col >= 0 &&
+                    !cte_map.count(to_lower(jc.table.table_name)) &&
+                    rhs->pk_is_i64 && right_join_col == rhs->pk_col && rows.size() <= 100000) {
+                    // Index Nested-Loop Join directly against rhs->pk_shard_index
+                    joined_rows.reserve(rows.size());
+                    for (const auto& lrow : rows) {
+                        const Value& lv = lrow[left_join_col];
+                        if (!lv.is_null() && lv.type == ColumnType::I64) {
+                            const size_t shard = zephyr::core::ShardedAugmentedBTree::shard_for_key(lv.i64);
+                            auto hit = rhs->pk_shard_index[shard].find(lv.i64);
+                            if (hit != rhs->pk_shard_index[shard].end()) {
+                                size_t rr = hit->second;
+                                if (rhs->live[rr]) {
+                                    std::vector<Value> combined = lrow;
+                                    combined.reserve(left_width + right_width);
+                                    for (size_t c = 0; c < right_width; ++c) {
+                                        combined.push_back(rhs->columns[c].get_value(rr));
+                                    }
+                                    joined_rows.push_back(std::move(combined));
+                                }
+                            }
+                        }
+                    }
+                } else if (left_join_col >= 0 && right_join_col >= 0) {
                     // Hash join
                     std::unordered_map<std::string, std::vector<size_t>> hash_table;
                     for (size_t r = 0; r < rhs->live.size(); ++r) {
@@ -3691,15 +4023,31 @@ ZephyrResultSet* ZephyrEngine::exec_select(
             }
             keyed.emplace_back(std::move(keys), std::move(out_rows[r]));
         }
-        std::stable_sort(keyed.begin(), keyed.end(), [&](const auto& a, const auto& b) {
+        auto cmp = [&](const auto& a, const auto& b) {
             for (size_t i = 0; i < s.order_by.size(); ++i) {
-                int cmp = compare_values(a.first[i], b.first[i]);
-                if (cmp != 0) {
-                    return s.order_by[i].desc ? (cmp > 0) : (cmp < 0);
+                int c = compare_values(a.first[i], b.first[i]);
+                if (c != 0) {
+                    return s.order_by[i].desc ? (c > 0) : (c < 0);
                 }
             }
             return false;
-        });
+        };
+        if (s.limit.has_value() && *s.limit >= 0) {
+            int64_t off = (s.offset.has_value() && *s.offset > 0) ? *s.offset : 0;
+            size_t k = static_cast<size_t>(off) + static_cast<size_t>(*s.limit);
+            if (k < keyed.size()) {
+                std::partial_sort(
+                    keyed.begin(),
+                    keyed.begin() + static_cast<ptrdiff_t>(k),
+                    keyed.end(),
+                    cmp);
+                keyed.resize(k);
+            } else {
+                std::stable_sort(keyed.begin(), keyed.end(), cmp);
+            }
+        } else {
+            std::stable_sort(keyed.begin(), keyed.end(), cmp);
+        }
         out_rows.clear();
         for (auto& kv : keyed) out_rows.push_back(std::move(kv.second));
     }
@@ -3726,7 +4074,7 @@ std::vector<uint8_t> ZephyrEngine::serialize_snapshot() const {
     std::vector<uint8_t> buf;
     // Magic "ZSNP"
     buf.push_back('Z'); buf.push_back('S'); buf.push_back('N'); buf.push_back('P');
-    write_u32(buf, 1);
+    write_u32(buf, 2);
     write_u32(buf, static_cast<uint32_t>(tables_.size()));
 
     for (const auto& [key, tbl] : tables_) {
@@ -3765,6 +4113,12 @@ std::vector<uint8_t> ZephyrEngine::serialize_snapshot() const {
                 }
             }
         }
+        write_u32(buf, static_cast<uint32_t>(tbl->indexes.size()));
+        for (const auto& idx : tbl->indexes) {
+            write_str(buf, idx.name);
+            write_u32(buf, static_cast<uint32_t>(idx.col_idx));
+            write_u8(buf, idx.unique ? 1 : 0);
+        }
     }
     return buf;
 }
@@ -3801,7 +4155,7 @@ bool ZephyrEngine::parse_snapshot_blob(const uint8_t* p, size_t len) {
     p += 4;
 
     uint32_t version = 0, table_count = 0;
-    if (!read_u32(p, end, version) || version != 1) return false;
+    if (!read_u32(p, end, version) || (version != 1 && version != 2)) return false;
     if (!read_u32(p, end, table_count)) return false;
 
     for (uint32_t t = 0; t < table_count; ++t) {
@@ -3895,6 +4249,25 @@ bool ZephyrEngine::parse_snapshot_blob(const uint8_t* p, size_t len) {
             }
             tbl->live.push_back(1);
             update_btree_for_row(*tbl, static_cast<size_t>(r));
+        }
+
+        if (version >= 2) {
+            uint32_t idx_count = 0;
+            if (!read_u32(p, end, idx_count)) return false;
+            for (uint32_t ii = 0; ii < idx_count; ++ii) {
+                SecondaryIndex idx;
+                uint32_t cidx = 0;
+                uint8_t uniq = 0;
+                if (!read_str(p, end, idx.name) || !read_u32(p, end, cidx) || !read_u8(p, end, uniq)) {
+                    return false;
+                }
+                if (cidx >= tbl->schema.size()) return false;
+                idx.col_idx = cidx;
+                idx.col_type = tbl->schema[cidx].type;
+                idx.unique = (uniq != 0);
+                secondary_index_populate(idx, *tbl);
+                tbl->indexes.push_back(std::move(idx));
+            }
         }
 
         tables_[to_lower(tname)] = std::move(tbl);

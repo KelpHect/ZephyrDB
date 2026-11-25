@@ -15,6 +15,7 @@ set(ZEPHYR_CORE_SOURCES
     src/storage/crypto.cpp
     src/storage/wal.cpp
     src/storage/mmap_store.cpp
+    src/storage/tiered_store.cpp
     src/sql/lexer.cpp
     src/sql/parser.cpp
     src/sql/simd_eval.cpp

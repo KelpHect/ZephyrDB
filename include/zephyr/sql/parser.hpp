@@ -33,8 +33,12 @@ private:
     bool has_error() const noexcept { return !error_.empty(); }
 
     std::optional<Stmt> parse_statement();
+    std::optional<Stmt> parse_create();
+    std::optional<Stmt> parse_drop();
     std::optional<CreateTableStmt> parse_create_table();
+    std::optional<CreateIndexStmt> parse_create_index(bool unique);
     std::optional<DropTableStmt> parse_drop_table();
+    std::optional<DropIndexStmt> parse_drop_index();
     std::optional<InsertStmt> parse_insert();
     std::optional<UpdateStmt> parse_update();
     std::optional<DeleteStmt> parse_delete();

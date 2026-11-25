@@ -70,7 +70,8 @@ Measured on Windows x64 (`MSVC 19.52`, `/std:c++latest /O2 /arch:AVX2`, `zephyrd
 | **SQL Precompiled PK Point-Update** | **0.33 µs/op (3.07 M updates/sec)** | Zero-clone in-place leaf delta |
 | **Same-Table Sharded PK Updates** (4 threads) | **8.83 M updates/sec** | 8-way `row_shard_mu` + `pk_shard_index` |
 | **Mixed MMORPG `2R + 2W` Workload** | **27.43 M ops/sec** | Lock-free reads + parallel per-table writes |
-| **Everyday SQL: 1 PK `SELECT` / 50 PK `SELECT`s** (10k rows) | **0.08 µs** / **4.10 µs** | O(1) `CompiledPkSelectPlan` fastpath |
+| **Everyday SQL: 1 PK `SELECT` / 50 PK `SELECT`s** (10k rows) | **0.08–0.11 µs** / **4.10–5.46 µs** | O(1) `CompiledPkSelectPlan` fastpath |
+| **Indexed SQL: `ORDER BY gold DESC LIMIT 10`** (10k rows) | **1.26 µs** | Opt-in `CREATE INDEX` (`O(log N + K)`) |
 | **Everyday SQL: 1 `INSERT` / 50 `INSERT`s** | **13.50 µs** / **62.70 µs** | Prepared `INSERT` |
 
 ---
@@ -172,6 +173,7 @@ A dark-mode Docsify documentation site is ready in [docs/](docs/index.html) (pub
 | [docs/wasm-guide.md](docs/wasm-guide.md) | Emscripten `-msimd128` build & Three.js / SolidJS usage |
 | [docs/studio.md](docs/studio.md) | Built-in dark-mode Zephyr Studio web inspector (`--studio-port`) |
 | [docs/security.md](docs/security.md) | ChaCha20-Poly1305 AEAD encryption at rest, HKDF, and strict sync WAL |
+| [docs/tiered-and-indexes.md](docs/tiered-and-indexes.md) | Cold mmap segments, `CREATE INDEX`, PGWire pipelining, WAL group commit |
 | [docs/performance.md](docs/performance.md) | Architecture deep dive & measured benchmarks |
 | [docs/abi.md](docs/abi.md) | Zero-copy C-ABI `extern "C"` signatures, byte offsets (`x64` & `wasm32`), Arena slab packing |
 | [docs/toolchain.md](docs/toolchain.md) | C++26 compiler flags (GCC 15/16, Clang 19+, MSVC 19.52+, Emscripten) & socket linking |

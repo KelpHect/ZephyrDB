@@ -15,3 +15,4 @@
   * [Postgres AST & Grammar](ast.md)
   * [C++26 Toolchain](toolchain.md)
   * [Performance & Benchmarks](performance.md)
+  - [Tiered Storage & Indexes](tiered-and-indexes.md)
