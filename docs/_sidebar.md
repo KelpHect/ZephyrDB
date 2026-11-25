@@ -4,6 +4,7 @@
 
 * Usage Guides
   * [SQL Guide](sql-guide.md)
+  - [Zephyr Studio](studio.md)
   * [Node.js Backend](node-backend.md)
   * [Unity C# Guide](unity-guide.md)
   * [WebAssembly & Three.js](wasm-guide.md)

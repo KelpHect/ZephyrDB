@@ -9,6 +9,7 @@
 #include "zephyr/c_abi.h"
 #include "zephyr/net/pgwire.hpp"
 #include "zephyr/net/raft.hpp"
+#include "zephyr/net/studio.hpp"
 
 namespace {
 
@@ -24,6 +25,7 @@ void print_usage(const char* prog) {
         << "Options:\n"
         << "  --data-dir <path>      Database directory (default: ./zephyr_data)\n"
         << "  --pgwire-port <port>   PostgreSQL wire protocol TCP port (default: 5432, 0=disabled)\n"
+        << "  --studio-port <port>   Zephyr Studio HTTP Web UI port (default: 0=disabled)\n"
         << "  --raft-id <id>         Raft node ID (default: 0 = standalone)\n"
         << "  --raft-port <port>     Raft UDP port (default: 7000)\n"
         << "  --peers <csv>          Raft peer list (e.g. 2@127.0.0.1:7002,3@127.0.0.1:7003)\n"
@@ -35,6 +37,7 @@ void print_usage(const char* prog) {
 int main(int argc, char** argv) {
     std::string data_dir = "./zephyr_data";
     uint16_t pgwire_port = 5432;
+    uint16_t studio_port = 0;
     uint32_t raft_id = 0;
     uint16_t raft_port = 7000;
     std::string peers_csv;
@@ -48,6 +51,8 @@ int main(int argc, char** argv) {
             data_dir = argv[++i];
         } else if (arg == "--pgwire-port" && i + 1 < argc) {
             pgwire_port = static_cast<uint16_t>(std::stoul(argv[++i]));
+        } else if (arg == "--studio-port" && i + 1 < argc) {
+            studio_port = static_cast<uint16_t>(std::stoul(argv[++i]));
         } else if (arg == "--raft-id" && i + 1 < argc) {
             raft_id = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--raft-port" && i + 1 < argc) {
@@ -99,12 +104,25 @@ int main(int argc, char** argv) {
         std::cout << "[PGWire v3.0] listening on TCP :" << pgwire.bound_port() << "\n";
     }
 
+    zephyr::net::StudioServer studio;
+    if (studio_port > 0) {
+        if (!studio.start(db, studio_port)) {
+            std::cerr << "Failed to start Zephyr Studio on TCP port " << studio_port << "\n";
+            pgwire.stop();
+            raft.stop();
+            zephyr_db_close(db);
+            return 1;
+        }
+        std::cout << "[Zephyr Studio] Web UI at http://127.0.0.1:" << studio.bound_port() << std::endl;
+    }
+
     std::cout << "ZephyrDB server ready (data-dir=" << data_dir << "). Press Ctrl+C to stop." << std::endl;
     while (!g_shutdown.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     std::cout << "\nShutting down ZephyrDB server...\n";
+    studio.stop();
     pgwire.stop();
     raft.stop();
     zephyr_db_close(db);

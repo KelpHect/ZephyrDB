@@ -388,6 +388,14 @@ std::optional<TableRef> Parser::parse_table_ref() {
     }
     TableRef ref;
     ref.table_name = extract_ident(advance());
+    if (match(TokenKind::Dot)) {
+        if (!is_ident_token(peek().kind)) {
+            set_error("expected table name after '.'");
+            return std::nullopt;
+        }
+        ref.table_name += ".";
+        ref.table_name += extract_ident(advance());
+    }
     if (match(TokenKind::KwAs)) {
         if (!is_ident_token(peek().kind)) {
             set_error("expected table alias after AS");

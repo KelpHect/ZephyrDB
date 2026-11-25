@@ -107,6 +107,18 @@ typedef struct ZephyrConfig {
     uint32_t _pad;
 } ZephyrConfig;
 
+/* 64 bytes */
+typedef struct ZephyrStats {
+    uint64_t table_count;
+    uint64_t total_rows;
+    uint64_t wal_lsn;
+    uint64_t wal_flushed_lsn;
+    uint64_t rcu_reclaimed;
+    uint64_t o1_fastpath_hits;
+    uint64_t prepared_queries;
+    uint64_t active_txns;
+} ZephyrStats;
+
 ZEPHYR_API ZephyrConfig zephyr_default_config(void);
 ZEPHYR_API ZephyrDB* zephyr_db_open(const ZephyrConfig* config);
 ZEPHYR_API void zephyr_db_close(ZephyrDB* db);
@@ -141,6 +153,8 @@ ZEPHYR_API ZephyrAggregate zephyr_aggregate_count(ZephyrDB* db, const char* tabl
 ZEPHYR_API ZephyrAggregate zephyr_aggregate_sum(ZephyrDB* db, const char* table_name, const char* col_name);
 
 ZEPHYR_API int32_t zephyr_checkpoint(ZephyrDB* db);
+ZEPHYR_API int32_t zephyr_exec_sync(ZephyrDB* db, const char* sql, uint64_t* rows_affected);
+ZEPHYR_API ZephyrStats zephyr_get_stats(ZephyrDB* db);
 ZEPHYR_API const char* zephyr_last_error(ZephyrDB* db);
 ZEPHYR_API const char* zephyr_result_to_json(ZephyrDB* db, const ZephyrResultSet* result, uint32_t* out_len);
 

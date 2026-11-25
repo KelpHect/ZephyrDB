@@ -78,6 +78,8 @@ struct Table {
     std::unordered_map<int64_t, size_t> pk_i64_index;
     std::unordered_map<std::string, size_t> pk_str_index;
     std::unique_ptr<zephyr::core::AugmentedBTree> btree;
+    mutable std::mutex write_mu;
+    mutable std::shared_mutex rw_mu;
 
     std::unique_ptr<Table> clone_data(zephyr::core::RcuReaper* reaper) const;
     int find_col(std::string_view col_name) const;
@@ -100,10 +102,34 @@ struct CompiledO1Plan {
     std::vector<Item> items;
 };
 
+struct CompiledPkUpdatePlan {
+    std::string table_lower;
+    std::string target_col_lower;
+    std::string pk_col_lower;
+    bool is_delta{false};
+    bool is_sub{false};
+    uint32_t val_param_idx{0}; // 1-based if > 0; 0 means val_literal is used
+    Value val_literal;
+    uint32_t pk_param_idx{0};  // 1-based if > 0; 0 means pk_literal is used
+    int64_t pk_literal{0};
+};
+
+struct CompiledPkInsertPlan {
+    struct Slot {
+        uint32_t param_idx{0}; // 1-based if > 0; 0 means literal is used
+        Value literal;
+    };
+    std::string table_lower;
+    std::vector<std::string> col_names_lower; // empty => positional matching table schema
+    std::vector<Slot> values;
+};
+
 struct PreparedStmt {
     std::string sql;
     std::vector<Stmt> stmts;
     std::optional<CompiledO1Plan> o1_plan;
+    std::optional<CompiledPkUpdatePlan> pk_update_plan;
+    std::optional<CompiledPkInsertPlan> pk_insert_plan;
 };
 
 class ZephyrEngine {
@@ -117,6 +143,7 @@ public:
     ZephyrEngine& operator=(const ZephyrEngine&) = delete;
 
     int32_t execute(std::string_view sql, uint64_t* rows_affected = nullptr);
+    int32_t execute_sync(std::string_view sql, uint64_t* rows_affected = nullptr);
     ZephyrResultSet* query(std::string_view sql,
                            const ZephyrValue* params = nullptr,
                            uint32_t param_count = 0);
@@ -133,6 +160,7 @@ public:
     ZephyrAggregate aggregate_count(std::string_view table_name);
     ZephyrAggregate aggregate_sum(std::string_view table_name, std::string_view col_name);
 
+    ZephyrStats get_stats() const;
     int32_t checkpoint();
     const char* last_error() const noexcept {
         std::lock_guard<std::mutex> lk(err_mu_);
@@ -159,8 +187,25 @@ private:
         std::string_view raw_sql,
         const std::vector<Stmt>& stmts,
         const ZephyrValue* params,
-        uint32_t param_count
+        uint32_t param_count,
+        bool sync_wal = false
     );
+
+    bool try_exec_pk_update_plan(
+        const PreparedStmt& stmt,
+        const ZephyrValue* params,
+        uint32_t param_count,
+        int32_t& out_status,
+        uint64_t& out_affected
+    );
+    bool try_exec_pk_insert_plan(
+        const PreparedStmt& stmt,
+        const ZephyrValue* params,
+        uint32_t param_count,
+        int32_t& out_status,
+        uint64_t& out_affected
+    );
+    std::unique_ptr<Table> build_virtual_table(std::string_view lower_name) const;
 
     void set_error(std::string_view msg);
     void clear_error();
@@ -181,7 +226,8 @@ private:
     ZephyrResultSet* exec_stmt(const Stmt& stmt,
                                std::string_view raw_sql,
                                const std::vector<Value>& params,
-                               bool log_wal);
+                               bool log_wal,
+                               bool sync_wal = false);
     ZephyrResultSet* exec_create_table(const CreateTableStmt& s);
     ZephyrResultSet* exec_drop_table(const DropTableStmt& s);
     ZephyrResultSet* exec_insert(const InsertStmt& s, const std::vector<Value>& params);
@@ -209,7 +255,7 @@ private:
     void update_btree_for_row(Table& tbl, size_t row_idx);
     void publish_catalog_snapshot();
 
-    void log_wal_entry(std::string_view sql);
+    void log_wal_entry(std::string_view sql, bool sync_wait = false);
     bool load_snapshot(const std::string& snap_path);
     std::vector<uint8_t> serialize_snapshot() const;
 
@@ -237,6 +283,10 @@ private:
     std::atomic<bool> has_error_{false};
     std::string last_error_;
     std::string last_json_;
+
+    std::atomic<uint64_t> o1_fastpath_hits_{0};
+    std::atomic<uint64_t> prepared_queries_{0};
+    std::atomic<uint64_t> active_txns_{0};
 };
 
 } // namespace zephyr::sql

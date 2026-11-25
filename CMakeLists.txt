@@ -20,6 +20,7 @@ set(ZEPHYR_CORE_SOURCES
     src/sql/executor.cpp
     src/net/raft.cpp
     src/net/pgwire.cpp
+    src/net/studio.cpp
     src/c_abi.cpp
 )
 

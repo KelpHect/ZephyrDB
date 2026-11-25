@@ -6,7 +6,14 @@
 #include <filesystem>
 
 #if defined(_WIN32)
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
   #include <io.h>
+  #include <windows.h>
 #elif !defined(__EMSCRIPTEN__)
   #include <unistd.h>
 #endif
@@ -54,20 +61,35 @@ uint64_t read_u64_le(const uint8_t* p) noexcept {
     return v;
 }
 
-void serialize_record(std::vector<uint8_t>& out, uint64_t lsn, uint8_t op, std::string_view sql) {
-    const uint32_t len = static_cast<uint32_t>(sql.size());
-    const size_t start = out.size();
+void serialize_record(std::vector<uint8_t>& out, uint64_t lsn, uint8_t op, std::string_view payload) {
+    const uint32_t len = static_cast<uint32_t>(payload.size());
     write_u32_le(out, WalManager::MAGIC);
     const size_t crc_start = out.size();
     write_u64_le(out, lsn);
     out.push_back(op);
     write_u32_le(out, len);
     if (len > 0) {
-        out.insert(out.end(), sql.begin(), sql.end());
+        const auto* bytes = reinterpret_cast<const uint8_t*>(payload.data());
+        out.insert(out.end(), bytes, bytes + len);
     }
     const uint32_t crc = crc32_update(0, out.data() + crc_start, out.size() - crc_start);
     write_u32_le(out, crc);
-    (void)start;
+}
+
+void os_flush_file(std::FILE* fp) noexcept {
+    if (!fp) {
+        return;
+    }
+#if defined(_WIN32)
+    const intptr_t os_handle = _get_osfhandle(_fileno(fp));
+    if (os_handle != -1) {
+        FlushFileBuffers(reinterpret_cast<HANDLE>(os_handle));
+    }
+#elif !defined(__EMSCRIPTEN__)
+    fsync(fileno(fp));
+#else
+    (void)fp;
+#endif
 }
 
 } // namespace
@@ -84,7 +106,11 @@ bool WalRingBuffer::try_push(uint64_t lsn, uint8_t op, std::string_view sql) {
     }
     buffer_[h].lsn = lsn;
     buffer_[h].op = op;
-    buffer_[h].sql.assign(sql.data(), sql.size());
+    if (sql.empty()) {
+        buffer_[h].sql.clear();
+    } else {
+        buffer_[h].sql.assign(sql.data(), sql.size());
+    }
     head_.store(next, std::memory_order_release);
     return true;
 }
@@ -151,6 +177,12 @@ bool WalManager::open(const std::string& wal_path, uint32_t flush_ms) {
     }
     next_lsn_.store(max_lsn + 1, std::memory_order_release);
     flushed_lsn_.store(max_lsn, std::memory_order_release);
+    synced_lsn_.store(max_lsn, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(cv_mu_);
+        wake_requested_ = false;
+        sync_requested_ = false;
+    }
 
     open_.store(true, std::memory_order_release);
     running_.store(true, std::memory_order_release);
@@ -169,15 +201,26 @@ void WalManager::close() {
     {
         std::lock_guard<std::mutex> lk(cv_mu_);
         wake_requested_ = true;
+        sync_requested_ = true;
     }
     wake_cv_.notify_all();
+    flush_cv_.notify_all();
     sched_.stop();
+    {
+        std::lock_guard<std::mutex> lk(cv_mu_);
+        sync_requested_ = true;
+    }
     drain_and_write();
 }
 
 uint64_t WalManager::append(uint8_t op, std::string_view sql, bool sync_wait) {
     if (!open_.load(std::memory_order_acquire)) {
         return 0;
+    }
+
+    if (sync_wait) {
+        std::lock_guard<std::mutex> clk(cv_mu_);
+        sync_requested_ = true;
     }
 
     uint64_t lsn = 0;
@@ -197,17 +240,26 @@ uint64_t WalManager::append(uint8_t op, std::string_view sql, bool sync_wait) {
     if (sync_wait) {
         {
             std::lock_guard<std::mutex> clk(cv_mu_);
+            sync_requested_ = true;
             wake_requested_ = true;
         }
         wake_cv_.notify_one();
 
         std::unique_lock<std::mutex> lk(cv_mu_);
         flush_cv_.wait(lk, [this, lsn] {
-            return flushed_lsn_.load(std::memory_order_acquire) >= lsn ||
+            return synced_lsn_.load(std::memory_order_acquire) >= lsn ||
                    !running_.load(std::memory_order_acquire);
         });
     }
     return lsn;
+}
+
+uint64_t WalManager::append_binary(uint8_t op, const uint8_t* payload, size_t len, bool sync_wait) {
+    std::string_view view;
+    if (payload != nullptr && len > 0) {
+        view = std::string_view(reinterpret_cast<const char*>(payload), len);
+    }
+    return append(op, view, sync_wait);
 }
 
 void WalManager::flush() {
@@ -215,19 +267,20 @@ void WalManager::flush() {
         return;
     }
     const uint64_t target = next_lsn_.load(std::memory_order_acquire) - 1;
-    if (flushed_lsn_.load(std::memory_order_acquire) >= target && ring_.empty()) {
+    if (synced_lsn_.load(std::memory_order_acquire) >= target && ring_.empty()) {
         return;
     }
 
     {
         std::lock_guard<std::mutex> lk(cv_mu_);
+        sync_requested_ = true;
         wake_requested_ = true;
     }
     wake_cv_.notify_one();
 
     std::unique_lock<std::mutex> lk(cv_mu_);
     flush_cv_.wait(lk, [this, target] {
-        return (flushed_lsn_.load(std::memory_order_acquire) >= target && ring_.empty()) ||
+        return (synced_lsn_.load(std::memory_order_acquire) >= target && ring_.empty()) ||
                !running_.load(std::memory_order_acquire);
     });
 }
@@ -237,7 +290,10 @@ void WalManager::guardian_loop() {
         {
             std::unique_lock<std::mutex> lk(cv_mu_);
             wake_cv_.wait_for(lk, std::chrono::milliseconds(flush_ms_), [this] {
-                return !running_.load(std::memory_order_acquire) || wake_requested_;
+                return !running_.load(std::memory_order_acquire) ||
+                       wake_requested_ ||
+                       sync_requested_ ||
+                       !ring_.empty();
             });
             wake_requested_ = false;
         }
@@ -247,38 +303,61 @@ void WalManager::guardian_loop() {
 
 void WalManager::drain_and_write() {
     std::vector<WalRingBuffer::Slot> batch;
-    std::vector<uint8_t> encoded;
+    ring_.pop_batch(batch, WalRingBuffer::CAPACITY);
 
-    while (ring_.pop_batch(batch, 256) > 0) {
-        encoded.clear();
-        uint64_t max_lsn = flushed_lsn_.load(std::memory_order_relaxed);
+    bool do_sync = false;
+    {
+        std::lock_guard<std::mutex> lk(cv_mu_);
+        do_sync = sync_requested_;
+        sync_requested_ = false;
+    }
+
+    const uint64_t prev_flushed = flushed_lsn_.load(std::memory_order_relaxed);
+    const uint64_t prev_synced = synced_lsn_.load(std::memory_order_relaxed);
+    if (batch.empty() && (!do_sync || prev_synced >= prev_flushed)) {
+        return;
+    }
+
+    std::vector<uint8_t> encoded;
+    uint64_t max_lsn = prev_flushed;
+    if (!batch.empty()) {
+        size_t total_bytes = 0;
+        for (const auto& s : batch) {
+            total_bytes += 21 + s.sql.size();
+        }
+        encoded.reserve(total_bytes);
+
         for (const auto& s : batch) {
             serialize_record(encoded, s.lsn, s.op, s.sql);
             if (s.lsn > max_lsn) {
                 max_lsn = s.lsn;
             }
         }
-
-        {
-            std::lock_guard<std::mutex> flk(file_mu_);
-            std::FILE* fp = std::fopen(wal_path_.c_str(), "ab");
-            if (fp) {
-                if (!encoded.empty()) {
-                    std::fwrite(encoded.data(), 1, encoded.size(), fp);
-                }
-                std::fflush(fp);
-#if defined(_WIN32)
-                _commit(_fileno(fp));
-#elif !defined(__EMSCRIPTEN__)
-                fsync(fileno(fp));
-#endif
-                std::fclose(fp);
-            }
-        }
-
-        flushed_lsn_.store(max_lsn, std::memory_order_release);
-        flush_cv_.notify_all();
     }
+
+    {
+        std::lock_guard<std::mutex> flk(file_mu_);
+        std::FILE* fp = std::fopen(wal_path_.c_str(), "ab");
+        if (fp) {
+            if (!encoded.empty()) {
+                std::fwrite(encoded.data(), 1, encoded.size(), fp);
+            }
+            std::fflush(fp);
+            if (do_sync) {
+                os_flush_file(fp);
+            }
+            std::fclose(fp);
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(cv_mu_);
+        flushed_lsn_.store(max_lsn, std::memory_order_release);
+        if (do_sync) {
+            synced_lsn_.store(max_lsn, std::memory_order_release);
+        }
+    }
+    flush_cv_.notify_all();
 }
 
 std::vector<WalRecord> WalManager::replay() const {
@@ -361,6 +440,7 @@ void WalManager::truncate(uint64_t up_to_lsn) {
             std::fwrite(encoded.data(), 1, encoded.size(), fp);
         }
         std::fflush(fp);
+        os_flush_file(fp);
         std::fclose(fp);
     }
 }

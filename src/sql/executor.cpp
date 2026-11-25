@@ -272,6 +272,62 @@ std::string value_key_string(const Value& v) {
     return "";
 }
 
+bool is_virtual_system_table(std::string_view lower_name) noexcept {
+    return lower_name == "information_schema.tables" ||
+           lower_name == "information_schema.columns" ||
+           lower_name == "pg_catalog.pg_tables";
+}
+
+const char* column_type_sql_name(ColumnType t) noexcept {
+    switch (t) {
+        case ColumnType::I64: return "BIGINT";
+        case ColumnType::F64: return "DOUBLE PRECISION";
+        case ColumnType::Bool: return "BOOLEAN";
+        case ColumnType::Text: return "TEXT";
+        case ColumnType::Bytea: return "BYTEA";
+        case ColumnType::Null: return "NULL";
+    }
+    return "NULL";
+}
+
+Value eval_literal_expr(const LiteralExpr& lit) {
+    return std::visit([](const auto& val) -> Value {
+        using V = std::decay_t<decltype(val)>;
+        if constexpr (std::is_same_v<V, std::nullptr_t>) return Value::make_null();
+        else if constexpr (std::is_same_v<V, int64_t>) return Value::make_i64(val);
+        else if constexpr (std::is_same_v<V, double>) return Value::make_f64(val);
+        else if constexpr (std::is_same_v<V, bool>) return Value::make_bool(val);
+        else return Value::make_text(val);
+    }, lit.value);
+}
+
+std::string format_sql_literal(const Value& v) {
+    switch (v.type) {
+        case ColumnType::Null: return "NULL";
+        case ColumnType::I64: return std::to_string(v.i64);
+        case ColumnType::F64: {
+            std::ostringstream oss;
+            oss.precision(17);
+            oss << v.f64;
+            return oss.str();
+        }
+        case ColumnType::Bool: return v.boolean ? "TRUE" : "FALSE";
+        case ColumnType::Text:
+        case ColumnType::Bytea: {
+            std::string out;
+            out.reserve(v.str.size() + 2);
+            out.push_back('\'');
+            for (char c : v.str) {
+                if (c == '\'') out.push_back('\'');
+                out.push_back(c);
+            }
+            out.push_back('\'');
+            return out;
+        }
+    }
+    return "NULL";
+}
+
 // Binary serialization helpers for snapshot
 void write_u8(std::vector<uint8_t>& buf, uint8_t v) { buf.push_back(v); }
 void write_u32(std::vector<uint8_t>& buf, uint32_t v) {
@@ -551,6 +607,23 @@ int32_t ZephyrEngine::execute(std::string_view sql, uint64_t* rows_affected) {
     return status;
 }
 
+int32_t ZephyrEngine::execute_sync(std::string_view sql, uint64_t* rows_affected) {
+    clear_error();
+    ParseResult parsed = parse_sql(sql);
+    if (!parsed.ok()) {
+        set_error(parsed.error);
+        return ZEPHYR_ERR_SYNTAX;
+    }
+    ZephyrResultSet* res = execute_stmts(sql, parsed.stmts, nullptr, 0, true);
+    if (!res) return ZEPHYR_ERR_INTERNAL;
+    int32_t status = static_cast<int32_t>(res->status);
+    if (rows_affected) {
+        *rows_affected = res->rows_affected;
+    }
+    free_result(res);
+    return status;
+}
+
 ZephyrResultSet* ZephyrEngine::query(
     std::string_view sql,
     const ZephyrValue* params,
@@ -561,7 +634,7 @@ ZephyrResultSet* ZephyrEngine::query(
     if (!parsed.ok()) {
         return make_error_result(ZEPHYR_ERR_SYNTAX, parsed.error);
     }
-    return execute_stmts(sql, parsed.stmts, params, param_count);
+    return execute_stmts(sql, parsed.stmts, params, param_count, false);
 }
 
 std::unique_ptr<PreparedStmt> ZephyrEngine::prepare(std::string_view sql) {
@@ -583,40 +656,427 @@ std::unique_ptr<PreparedStmt> ZephyrEngine::prepare(std::string_view sql) {
             !s.offset.has_value() && !s.items.empty()) {
             CompiledO1Plan plan;
             plan.table_lower = to_lower(s.from->table_name);
-            plan.items.reserve(s.items.size());
-            bool all_o1 = true;
+            if (!is_virtual_system_table(plan.table_lower)) {
+                plan.items.reserve(s.items.size());
+                bool all_o1 = true;
 
-            for (size_t i = 0; i < s.items.size(); ++i) {
-                const auto& item = s.items[i];
-                if (item.is_star || !item.expr ||
-                    !std::holds_alternative<AggregateExpr>(item.expr->node)) {
-                    all_o1 = false;
-                    break;
+                for (size_t i = 0; i < s.items.size(); ++i) {
+                    const auto& item = s.items[i];
+                    if (item.is_star || !item.expr ||
+                        !std::holds_alternative<AggregateExpr>(item.expr->node)) {
+                        all_o1 = false;
+                        break;
+                    }
+                    const auto& agg = std::get<AggregateExpr>(item.expr->node);
+                    std::string label = item.alias.empty()
+                        ? infer_expr_name(item.expr.get(), i) : item.alias;
+
+                    if (agg.func == AggFunc::Count && agg.is_star) {
+                        plan.items.push_back(CompiledO1Plan::Item{true, {}, std::move(label)});
+                    } else if (agg.func == AggFunc::Sum && agg.arg &&
+                               std::holds_alternative<ColumnRefExpr>(agg.arg->node)) {
+                        const auto& cref = std::get<ColumnRefExpr>(agg.arg->node);
+                        plan.items.push_back(CompiledO1Plan::Item{
+                            false, to_lower(cref.column), std::move(label)});
+                    } else {
+                        all_o1 = false;
+                        break;
+                    }
                 }
-                const auto& agg = std::get<AggregateExpr>(item.expr->node);
-                std::string label = item.alias.empty()
-                    ? infer_expr_name(item.expr.get(), i) : item.alias;
 
-                if (agg.func == AggFunc::Count && agg.is_star) {
-                    plan.items.push_back(CompiledO1Plan::Item{true, {}, std::move(label)});
-                } else if (agg.func == AggFunc::Sum && agg.arg &&
-                           std::holds_alternative<ColumnRefExpr>(agg.arg->node)) {
-                    const auto& cref = std::get<ColumnRefExpr>(agg.arg->node);
-                    plan.items.push_back(CompiledO1Plan::Item{
-                        false, to_lower(cref.column), std::move(label)});
-                } else {
-                    all_o1 = false;
-                    break;
+                if (all_o1 && !plan.items.empty()) {
+                    ps->o1_plan = std::move(plan);
                 }
             }
+        }
+    }
 
-            if (all_o1 && !plan.items.empty()) {
-                ps->o1_plan = std::move(plan);
+    // Pre-compile single-column PK point-UPDATE plan
+    if (ps->stmts.size() == 1 && std::holds_alternative<UpdateStmt>(ps->stmts[0])) {
+        const auto& u = std::get<UpdateStmt>(ps->stmts[0]);
+        if (u.assignments.size() == 1 && u.returning.empty() && u.where &&
+            std::holds_alternative<BinaryExpr>(u.where->node)) {
+            const auto& wbin = std::get<BinaryExpr>(u.where->node);
+            if (wbin.op == BinaryOp::Eq && wbin.left && wbin.right) {
+                const ColumnRefExpr* pk_cref = nullptr;
+                const Expr* pk_rhs = nullptr;
+                if (std::holds_alternative<ColumnRefExpr>(wbin.left->node)) {
+                    pk_cref = &std::get<ColumnRefExpr>(wbin.left->node);
+                    pk_rhs = wbin.right.get();
+                } else if (std::holds_alternative<ColumnRefExpr>(wbin.right->node)) {
+                    pk_cref = &std::get<ColumnRefExpr>(wbin.right->node);
+                    pk_rhs = wbin.left.get();
+                }
+
+                bool pk_ok = false;
+                uint32_t pk_param_idx = 0;
+                int64_t pk_literal = 0;
+                if (pk_cref && pk_rhs) {
+                    if (std::holds_alternative<ParamExpr>(pk_rhs->node)) {
+                        pk_param_idx = std::get<ParamExpr>(pk_rhs->node).index;
+                        pk_ok = (pk_param_idx > 0);
+                    } else if (std::holds_alternative<LiteralExpr>(pk_rhs->node)) {
+                        const auto& lit = std::get<LiteralExpr>(pk_rhs->node);
+                        if (std::holds_alternative<int64_t>(lit.value)) {
+                            pk_literal = std::get<int64_t>(lit.value);
+                            pk_ok = true;
+                        }
+                    }
+                }
+
+                if (pk_ok && u.assignments[0].value) {
+                    CompiledPkUpdatePlan plan;
+                    plan.table_lower = to_lower(u.table_name);
+                    plan.target_col_lower = to_lower(u.assignments[0].column);
+                    plan.pk_col_lower = to_lower(pk_cref->column);
+                    plan.pk_param_idx = pk_param_idx;
+                    plan.pk_literal = pk_literal;
+
+                    const Expr* val_expr = u.assignments[0].value.get();
+                    bool val_ok = false;
+                    if (std::holds_alternative<ParamExpr>(val_expr->node)) {
+                        plan.is_delta = false;
+                        plan.val_param_idx = std::get<ParamExpr>(val_expr->node).index;
+                        val_ok = (plan.val_param_idx > 0);
+                    } else if (std::holds_alternative<LiteralExpr>(val_expr->node)) {
+                        plan.is_delta = false;
+                        plan.val_param_idx = 0;
+                        plan.val_literal = eval_literal_expr(std::get<LiteralExpr>(val_expr->node));
+                        val_ok = true;
+                    } else if (std::holds_alternative<BinaryExpr>(val_expr->node)) {
+                        const auto& vbin = std::get<BinaryExpr>(val_expr->node);
+                        if ((vbin.op == BinaryOp::Add || vbin.op == BinaryOp::Sub) &&
+                            vbin.left && vbin.right) {
+                            const Expr* delta_expr = nullptr;
+                            if (std::holds_alternative<ColumnRefExpr>(vbin.left->node) &&
+                                iequals_ascii(std::get<ColumnRefExpr>(vbin.left->node).column,
+                                              plan.target_col_lower)) {
+                                delta_expr = vbin.right.get();
+                                plan.is_sub = (vbin.op == BinaryOp::Sub);
+                            } else if (vbin.op == BinaryOp::Add &&
+                                       std::holds_alternative<ColumnRefExpr>(vbin.right->node) &&
+                                       iequals_ascii(std::get<ColumnRefExpr>(vbin.right->node).column,
+                                                     plan.target_col_lower)) {
+                                delta_expr = vbin.left.get();
+                                plan.is_sub = false;
+                            }
+                            if (delta_expr) {
+                                plan.is_delta = true;
+                                if (std::holds_alternative<ParamExpr>(delta_expr->node)) {
+                                    plan.val_param_idx = std::get<ParamExpr>(delta_expr->node).index;
+                                    val_ok = (plan.val_param_idx > 0);
+                                } else if (std::holds_alternative<LiteralExpr>(delta_expr->node)) {
+                                    plan.val_param_idx = 0;
+                                    plan.val_literal = eval_literal_expr(
+                                        std::get<LiteralExpr>(delta_expr->node));
+                                    val_ok = (plan.val_literal.type == ColumnType::I64 ||
+                                              plan.val_literal.type == ColumnType::F64);
+                                }
+                            }
+                        }
+                    }
+
+                    if (val_ok) {
+                        ps->pk_update_plan = std::move(plan);
+                    }
+                }
+            }
+        }
+    }
+
+    // Pre-compile single-row PK point-INSERT plan
+    if (ps->stmts.size() == 1 && std::holds_alternative<InsertStmt>(ps->stmts[0])) {
+        const auto& ins = std::get<InsertStmt>(ps->stmts[0]);
+        if (ins.rows.size() == 1 && ins.returning.empty() && !ins.rows[0].empty()) {
+            CompiledPkInsertPlan plan;
+            plan.table_lower = to_lower(ins.table_name);
+            plan.col_names_lower.reserve(ins.columns.size());
+            for (const auto& c : ins.columns) {
+                plan.col_names_lower.push_back(to_lower(c));
+            }
+            plan.values.reserve(ins.rows[0].size());
+            bool all_simple = true;
+            for (const auto& e : ins.rows[0]) {
+                if (!e) { all_simple = false; break; }
+                CompiledPkInsertPlan::Slot slot;
+                if (std::holds_alternative<ParamExpr>(e->node)) {
+                    slot.param_idx = std::get<ParamExpr>(e->node).index;
+                    if (slot.param_idx == 0) { all_simple = false; break; }
+                } else if (std::holds_alternative<LiteralExpr>(e->node)) {
+                    slot.param_idx = 0;
+                    slot.literal = eval_literal_expr(std::get<LiteralExpr>(e->node));
+                } else {
+                    all_simple = false;
+                    break;
+                }
+                plan.values.push_back(std::move(slot));
+            }
+            if (all_simple) {
+                ps->pk_insert_plan = std::move(plan);
             }
         }
     }
 
     return ps;
+}
+
+bool ZephyrEngine::try_exec_pk_update_plan(
+    const PreparedStmt& stmt,
+    const ZephyrValue* params,
+    uint32_t param_count,
+    int32_t& out_status,
+    uint64_t& out_affected
+) {
+    const auto& plan = *stmt.pk_update_plan;
+    out_status = ZEPHYR_OK;
+    out_affected = 0;
+
+    int64_t pk_val = plan.pk_literal;
+    if (plan.pk_param_idx > 0) {
+        if (!params || plan.pk_param_idx > param_count) return false;
+        const ZephyrValue& pv = params[plan.pk_param_idx - 1];
+        if (pv.type != ZEPHYR_TYPE_I64) return false;
+        pk_val = pv.as.i64;
+    }
+
+    Value rhs_val;
+    if (plan.val_param_idx > 0) {
+        if (!params || plan.val_param_idx > param_count) return false;
+        rhs_val = from_c_value(params[plan.val_param_idx - 1]);
+    } else {
+        rhs_val = plan.val_literal;
+    }
+
+    std::shared_lock<std::shared_mutex> cat_lk(mu_);
+    if (in_txn_.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    const CatalogSnapshot* snap = catalog_snap_.load(std::memory_order_acquire);
+    Table* tbl = snap ? snap->find(plan.table_lower) : nullptr;
+    if (!tbl) {
+        set_error("table not found: " + plan.table_lower);
+        out_status = ZEPHYR_ERR_NOT_FOUND;
+        return true;
+    }
+
+    if (!tbl->pk_is_i64 || tbl->pk_col < 0 ||
+        !iequals_ascii(tbl->schema[tbl->pk_col].name, plan.pk_col_lower)) {
+        return false;
+    }
+
+    int target_cidx = tbl->find_col_nocase(plan.target_col_lower);
+    if (target_cidx < 0) {
+        set_error("unknown column: " + plan.target_col_lower);
+        out_status = ZEPHYR_ERR_NOT_FOUND;
+        return true;
+    }
+    if (target_cidx == tbl->pk_col) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> tbl_lk(tbl->write_mu);
+    std::unique_lock<std::shared_mutex> row_lk(tbl->rw_mu);
+
+    auto pit = tbl->pk_i64_index.find(pk_val);
+    if (pit == tbl->pk_i64_index.end()) {
+        out_status = ZEPHYR_OK;
+        out_affected = 0;
+        return true;
+    }
+
+    const size_t r = pit->second;
+    const ColumnSchema& cs = tbl->schema[target_cidx];
+    ColumnData& cdata = tbl->columns[target_cidx];
+
+    Value new_val;
+    if (plan.is_delta) {
+        if (cdata.nulls[r] || rhs_val.is_null()) {
+            new_val = Value::make_null();
+        } else if (cs.type == ColumnType::I64 && rhs_val.type == ColumnType::I64) {
+            int64_t delta = plan.is_sub ? -rhs_val.i64 : rhs_val.i64;
+            new_val = Value::make_i64(cdata.i64_data[r] + delta);
+        } else if (cs.type == ColumnType::F64 &&
+                   (rhs_val.type == ColumnType::F64 || rhs_val.type == ColumnType::I64)) {
+            double d = (rhs_val.type == ColumnType::F64)
+                ? rhs_val.f64 : static_cast<double>(rhs_val.i64);
+            if (plan.is_sub) d = -d;
+            new_val = Value::make_f64(cdata.f64_data[r] + d);
+        } else {
+            return false;
+        }
+    } else {
+        std::string err;
+        new_val = coerce_value(rhs_val, cs.type, err);
+        if (!err.empty()) {
+            set_error(err);
+            out_status = ZEPHYR_ERR_INVALID_ARG;
+            return true;
+        }
+    }
+
+    if (cs.not_null && new_val.is_null()) {
+        set_error("NULL violates NOT NULL");
+        out_status = ZEPHYR_ERR_CONSTRAINT;
+        return true;
+    }
+
+    cdata.set_value(r, new_val);
+    update_btree_for_row(*tbl, r);
+
+    if (!in_replay_ && wal_.is_open()) {
+        if (param_count == 0) {
+            log_wal_entry(stmt.sql, false);
+        } else {
+            std::string wal_sql = "UPDATE " + tbl->name + " SET " + cs.name + " = " +
+                                  format_sql_literal(new_val) + " WHERE " +
+                                  tbl->schema[tbl->pk_col].name + " = " +
+                                  std::to_string(pk_val);
+            log_wal_entry(wal_sql, false);
+        }
+    }
+
+    out_status = ZEPHYR_OK;
+    out_affected = 1;
+    return true;
+}
+
+bool ZephyrEngine::try_exec_pk_insert_plan(
+    const PreparedStmt& stmt,
+    const ZephyrValue* params,
+    uint32_t param_count,
+    int32_t& out_status,
+    uint64_t& out_affected
+) {
+    const auto& plan = *stmt.pk_insert_plan;
+    out_status = ZEPHYR_OK;
+    out_affected = 0;
+
+    std::shared_lock<std::shared_mutex> cat_lk(mu_);
+    if (in_txn_.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    const CatalogSnapshot* snap = catalog_snap_.load(std::memory_order_acquire);
+    Table* tbl = snap ? snap->find(plan.table_lower) : nullptr;
+    if (!tbl) {
+        set_error("table not found: " + plan.table_lower);
+        out_status = ZEPHYR_ERR_NOT_FOUND;
+        return true;
+    }
+
+    const size_t ncols = tbl->schema.size();
+    std::vector<size_t> target_cols;
+    if (plan.col_names_lower.empty()) {
+        if (plan.values.size() != ncols) {
+            set_error("INSERT column count mismatch");
+            out_status = ZEPHYR_ERR_INVALID_ARG;
+            return true;
+        }
+        target_cols.resize(ncols);
+        for (size_t i = 0; i < ncols; ++i) target_cols[i] = i;
+    } else {
+        if (plan.values.size() != plan.col_names_lower.size()) {
+            set_error("INSERT column count mismatch");
+            out_status = ZEPHYR_ERR_INVALID_ARG;
+            return true;
+        }
+        target_cols.reserve(plan.col_names_lower.size());
+        for (const auto& cname : plan.col_names_lower) {
+            int idx = tbl->find_col_nocase(cname);
+            if (idx < 0) {
+                set_error("unknown column: " + cname);
+                out_status = ZEPHYR_ERR_NOT_FOUND;
+                return true;
+            }
+            target_cols.push_back(static_cast<size_t>(idx));
+        }
+    }
+
+    std::vector<Value> full_row(ncols, Value::make_null());
+    for (size_t j = 0; j < target_cols.size(); ++j) {
+        const auto& slot = plan.values[j];
+        Value raw;
+        if (slot.param_idx > 0) {
+            if (params && slot.param_idx <= param_count) {
+                raw = from_c_value(params[slot.param_idx - 1]);
+            } else {
+                raw = Value::make_null();
+            }
+        } else {
+            raw = slot.literal;
+        }
+        std::string err;
+        Value coerced = coerce_value(raw, tbl->schema[target_cols[j]].type, err);
+        if (!err.empty()) {
+            set_error(err);
+            out_status = ZEPHYR_ERR_INVALID_ARG;
+            return true;
+        }
+        full_row[target_cols[j]] = std::move(coerced);
+    }
+
+    for (size_t c = 0; c < ncols; ++c) {
+        if (tbl->schema[c].not_null && full_row[c].is_null()) {
+            set_error("NULL value violates NOT NULL on " + tbl->schema[c].name);
+            out_status = ZEPHYR_ERR_CONSTRAINT;
+            return true;
+        }
+    }
+
+    std::lock_guard<std::mutex> tbl_lk(tbl->write_mu);
+    std::unique_lock<std::shared_mutex> row_lk(tbl->rw_mu);
+
+    if (tbl->pk_col >= 0) {
+        const Value& pk_val = full_row[tbl->pk_col];
+        if (tbl->pk_is_i64) {
+            if (tbl->pk_i64_index.count(pk_val.i64)) {
+                set_error("duplicate primary key");
+                out_status = ZEPHYR_ERR_CONSTRAINT;
+                return true;
+            }
+        } else {
+            if (tbl->pk_str_index.count(value_key_string(pk_val))) {
+                set_error("duplicate primary key");
+                out_status = ZEPHYR_ERR_CONSTRAINT;
+                return true;
+            }
+        }
+    }
+
+    const size_t row_idx = tbl->live.size();
+    for (size_t c = 0; c < ncols; ++c) {
+        tbl->columns[c].push_value(full_row[c]);
+    }
+    tbl->live.push_back(1);
+
+    if (tbl->pk_col >= 0) {
+        const Value& pk_val = full_row[tbl->pk_col];
+        if (tbl->pk_is_i64) {
+            tbl->pk_i64_index[pk_val.i64] = row_idx;
+        } else {
+            tbl->pk_str_index[value_key_string(pk_val)] = row_idx;
+        }
+    }
+    update_btree_for_row(*tbl, row_idx);
+
+    if (!in_replay_ && wal_.is_open()) {
+        if (param_count == 0) {
+            log_wal_entry(stmt.sql, false);
+        } else {
+            std::string wal_sql = "INSERT INTO " + tbl->name + " VALUES (";
+            for (size_t c = 0; c < ncols; ++c) {
+                if (c > 0) wal_sql += ", ";
+                wal_sql += format_sql_literal(full_row[c]);
+            }
+            wal_sql += ")";
+            log_wal_entry(wal_sql, false);
+        }
+    }
+
+    out_status = ZEPHYR_OK;
+    out_affected = 1;
+    return true;
 }
 
 ZephyrResultSet* ZephyrEngine::query_prepared(
@@ -625,6 +1085,7 @@ ZephyrResultSet* ZephyrEngine::query_prepared(
     uint32_t param_count
 ) {
     clear_error();
+    prepared_queries_.fetch_add(1, std::memory_order_relaxed);
 
     // Lock-free RCU O(1) fastpath: zero shared_mutex, zero std::vector/std::string allocations
     if (stmt.o1_plan.has_value() && !in_txn_.load(std::memory_order_acquire)) {
@@ -680,6 +1141,7 @@ ZephyrResultSet* ZephyrEngine::query_prepared(
             }
 
             if (ok) {
+                o1_fastpath_hits_.fetch_add(1, std::memory_order_relaxed);
                 auto* arena = acquire_arena(static_cast<size_t>(config_.arena_slab_bytes));
                 auto* rs = arena->create<ZephyrResultSet>();
                 rs->_arena_handle = arena;
@@ -712,7 +1174,31 @@ ZephyrResultSet* ZephyrEngine::query_prepared(
         }
     }
 
-    return execute_stmts(stmt.sql, stmt.stmts, params, param_count);
+    // Precompiled PK point-UPDATE fastpath
+    if (stmt.pk_update_plan.has_value() && !in_txn_.load(std::memory_order_acquire)) {
+        int32_t st = ZEPHYR_OK;
+        uint64_t affected = 0;
+        if (try_exec_pk_update_plan(stmt, params, param_count, st, affected)) {
+            if (st != ZEPHYR_OK) {
+                return make_error_result(static_cast<uint32_t>(st), last_error());
+            }
+            return pack_result({}, {}, {}, affected, 0);
+        }
+    }
+
+    // Precompiled PK point-INSERT fastpath
+    if (stmt.pk_insert_plan.has_value() && !in_txn_.load(std::memory_order_acquire)) {
+        int32_t st = ZEPHYR_OK;
+        uint64_t affected = 0;
+        if (try_exec_pk_insert_plan(stmt, params, param_count, st, affected)) {
+            if (st != ZEPHYR_OK) {
+                return make_error_result(static_cast<uint32_t>(st), last_error());
+            }
+            return pack_result({}, {}, {}, affected, 0);
+        }
+    }
+
+    return execute_stmts(stmt.sql, stmt.stmts, params, param_count, false);
 }
 
 int32_t ZephyrEngine::exec_prepared(
@@ -721,6 +1207,43 @@ int32_t ZephyrEngine::exec_prepared(
     uint32_t param_count,
     uint64_t* rows_affected
 ) {
+    // Direct zero-arena fastpath for precompiled PK point-UPDATE / point-INSERT
+    if (!in_txn_.load(std::memory_order_acquire)) {
+        if (stmt.pk_update_plan.has_value()) {
+            clear_error();
+            prepared_queries_.fetch_add(1, std::memory_order_relaxed);
+            int32_t st = ZEPHYR_OK;
+            uint64_t affected = 0;
+            if (try_exec_pk_update_plan(stmt, params, param_count, st, affected)) {
+                if (rows_affected) *rows_affected = affected;
+                return st;
+            }
+            // Fall through to execute_stmts (already counted in prepared_queries_)
+            ZephyrResultSet* res = execute_stmts(stmt.sql, stmt.stmts, params, param_count, false);
+            if (!res) return ZEPHYR_ERR_INTERNAL;
+            int32_t status = static_cast<int32_t>(res->status);
+            if (rows_affected) *rows_affected = res->rows_affected;
+            free_result(res);
+            return status;
+        }
+        if (stmt.pk_insert_plan.has_value()) {
+            clear_error();
+            prepared_queries_.fetch_add(1, std::memory_order_relaxed);
+            int32_t st = ZEPHYR_OK;
+            uint64_t affected = 0;
+            if (try_exec_pk_insert_plan(stmt, params, param_count, st, affected)) {
+                if (rows_affected) *rows_affected = affected;
+                return st;
+            }
+            ZephyrResultSet* res = execute_stmts(stmt.sql, stmt.stmts, params, param_count, false);
+            if (!res) return ZEPHYR_ERR_INTERNAL;
+            int32_t status = static_cast<int32_t>(res->status);
+            if (rows_affected) *rows_affected = res->rows_affected;
+            free_result(res);
+            return status;
+        }
+    }
+
     ZephyrResultSet* res = query_prepared(stmt, params, param_count);
     if (!res) return ZEPHYR_ERR_INTERNAL;
     int32_t status = static_cast<int32_t>(res->status);
@@ -735,7 +1258,8 @@ ZephyrResultSet* ZephyrEngine::execute_stmts(
     std::string_view raw_sql,
     const std::vector<Stmt>& stmts,
     const ZephyrValue* params,
-    uint32_t param_count
+    uint32_t param_count,
+    bool sync_wal
 ) {
     std::vector<Value> cpp_params;
     if (params && param_count > 0) {
@@ -749,15 +1273,44 @@ ZephyrResultSet* ZephyrEngine::execute_stmts(
         return pack_result({}, {}, {}, 0, 0);
     }
 
-    if (stmts.size() == 1 &&
-        std::holds_alternative<SelectStmt>(stmts[0]) &&
-        !in_txn_.load(std::memory_order_acquire)) {
-        std::shared_lock<std::shared_mutex> lk(mu_);
-        ZephyrResultSet* res = exec_stmt(stmts[0], raw_sql, cpp_params, false);
-        if (!res) {
-            return make_error_result(ZEPHYR_ERR_INTERNAL, "null execution result");
+    if (stmts.size() == 1 && !in_txn_.load(std::memory_order_acquire)) {
+        if (std::holds_alternative<SelectStmt>(stmts[0])) {
+            std::shared_lock<std::shared_mutex> lk(mu_);
+            if (!in_txn_.load(std::memory_order_acquire)) {
+                ZephyrResultSet* res = exec_stmt(stmts[0], raw_sql, cpp_params, false, false);
+                if (!res) {
+                    return make_error_result(ZEPHYR_ERR_INTERNAL, "null execution result");
+                }
+                return res;
+            }
+        } else if (std::holds_alternative<InsertStmt>(stmts[0]) ||
+                   std::holds_alternative<UpdateStmt>(stmts[0]) ||
+                   std::holds_alternative<DeleteStmt>(stmts[0])) {
+            std::shared_lock<std::shared_mutex> cat_lk(mu_);
+            if (!in_txn_.load(std::memory_order_acquire)) {
+                std::string_view tname;
+                if (const auto* ins = std::get_if<InsertStmt>(&stmts[0])) tname = ins->table_name;
+                else if (const auto* upd = std::get_if<UpdateStmt>(&stmts[0])) tname = upd->table_name;
+                else if (const auto* del = std::get_if<DeleteStmt>(&stmts[0])) tname = del->table_name;
+
+                char lower_buf[128];
+                std::string lower_heap;
+                std::string_view key = to_lower_sv(tname, lower_buf, sizeof(lower_buf), lower_heap);
+                const CatalogSnapshot* snap = catalog_snap_.load(std::memory_order_acquire);
+                Table* tbl = snap ? snap->find(key) : nullptr;
+                if (!tbl) {
+                    return make_error_result(ZEPHYR_ERR_NOT_FOUND, "table not found: " + std::string(tname));
+                }
+
+                std::lock_guard<std::mutex> tbl_lk(tbl->write_mu);
+                std::unique_lock<std::shared_mutex> row_lk(tbl->rw_mu);
+                ZephyrResultSet* res = exec_stmt(stmts[0], raw_sql, cpp_params, true, sync_wal);
+                if (!res) {
+                    return make_error_result(ZEPHYR_ERR_INTERNAL, "null execution result");
+                }
+                return res;
+            }
         }
-        return res;
     }
 
     std::unique_lock<std::shared_mutex> lk(mu_);
@@ -768,7 +1321,7 @@ ZephyrResultSet* ZephyrEngine::execute_stmts(
             free_result(last_res);
             last_res = nullptr;
         }
-        last_res = exec_stmt(stmts[i], raw_sql, cpp_params, stmts.size() == 1);
+        last_res = exec_stmt(stmts[i], raw_sql, cpp_params, stmts.size() == 1, sync_wal);
         if (!last_res) {
             return make_error_result(ZEPHYR_ERR_INTERNAL, "null execution result");
         }
@@ -779,6 +1332,9 @@ ZephyrResultSet* ZephyrEngine::execute_stmts(
     }
     if (stmts.size() > 1 && last_res) {
         last_res->rows_affected = total_affected;
+        if (sync_wal && !in_replay_ && !in_txn_.load(std::memory_order_acquire) && wal_.is_open()) {
+            log_wal_entry(raw_sql, true);
+        }
     }
     return last_res;
 }
@@ -799,6 +1355,7 @@ ZephyrAggregate ZephyrEngine::aggregate_count(std::string_view table_name) {
     }
     agg.count = static_cast<int64_t>(tbl->btree->total_count());
     agg.status = ZEPHYR_OK;
+    o1_fastpath_hits_.fetch_add(1, std::memory_order_relaxed);
     return agg;
 }
 
@@ -845,6 +1402,7 @@ ZephyrAggregate ZephyrEngine::aggregate_sum(std::string_view table_name, std::st
                 agg.count = static_cast<int64_t>(tbl2->btree->total_count());
             }
             agg.status = ZEPHYR_OK;
+            o1_fastpath_hits_.fetch_add(1, std::memory_order_relaxed);
             return agg;
         } else if (cs.type == ColumnType::I64 || cs.type == ColumnType::F64) {
             need_fallback_scan = true;
@@ -864,6 +1422,7 @@ ZephyrAggregate ZephyrEngine::aggregate_sum(std::string_view table_name, std::st
             return agg;
         }
         const Table& tbl = *it->second;
+        std::shared_lock<std::shared_mutex> row_lk(tbl.rw_mu);
         int col_idx = tbl.find_col_nocase(col_name);
         if (col_idx < 0) {
             agg.status = ZEPHYR_ERR_NOT_FOUND;
@@ -884,6 +1443,30 @@ ZephyrAggregate ZephyrEngine::aggregate_sum(std::string_view table_name, std::st
     }
     agg.status = ZEPHYR_OK;
     return agg;
+}
+
+ZephyrStats ZephyrEngine::get_stats() const {
+    ZephyrStats stats{};
+    {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        stats.table_count = tables_.size();
+        uint64_t rows = 0;
+        for (const auto& [k, tbl] : tables_) {
+            if (tbl && tbl->btree) {
+                rows += tbl->btree->total_count();
+            }
+        }
+        stats.total_rows = rows;
+    }
+    if (wal_.is_open()) {
+        stats.wal_lsn = wal_.last_lsn();
+        stats.wal_flushed_lsn = wal_.flushed_lsn();
+    }
+    stats.rcu_reclaimed = reaper_.reclaimed_total();
+    stats.o1_fastpath_hits = o1_fastpath_hits_.load(std::memory_order_relaxed);
+    stats.prepared_queries = prepared_queries_.load(std::memory_order_relaxed);
+    stats.active_txns = active_txns_.load(std::memory_order_relaxed);
+    return stats;
 }
 
 int32_t ZephyrEngine::checkpoint() {
@@ -1154,13 +1737,13 @@ Value ZephyrEngine::eval_expr(const Expr& expr, const EvalContext& ctx) {
 // Statement Dispatch & WAL
 // ============================================================================
 
-void ZephyrEngine::log_wal_entry(std::string_view sql) {
+void ZephyrEngine::log_wal_entry(std::string_view sql, bool sync_wait) {
     if (in_replay_ || !wal_.is_open()) return;
-    if (in_txn_) {
+    if (in_txn_.load(std::memory_order_acquire)) {
         txn_wal_buffer_.emplace_back(sql);
         return;
     }
-    uint64_t lsn = wal_.append(1, sql, false);
+    uint64_t lsn = wal_.append(1, sql, sync_wait);
     if (replicate_cb_ && lsn > 0) {
         replicate_cb_(lsn, sql);
     }
@@ -1170,29 +1753,30 @@ ZephyrResultSet* ZephyrEngine::exec_stmt(
     const Stmt& stmt,
     std::string_view raw_sql,
     const std::vector<Value>& params,
-    bool log_wal
+    bool log_wal,
+    bool sync_wal
 ) {
     return std::visit([&](const auto& s) -> ZephyrResultSet* {
         using T = std::decay_t<decltype(s)>;
         if constexpr (std::is_same_v<T, CreateTableStmt>) {
             auto* r = exec_create_table(s);
-            if (r->status == ZEPHYR_OK && log_wal) log_wal_entry(raw_sql);
+            if (r->status == ZEPHYR_OK && log_wal) log_wal_entry(raw_sql, sync_wal);
             return r;
         } else if constexpr (std::is_same_v<T, DropTableStmt>) {
             auto* r = exec_drop_table(s);
-            if (r->status == ZEPHYR_OK && log_wal) log_wal_entry(raw_sql);
+            if (r->status == ZEPHYR_OK && log_wal) log_wal_entry(raw_sql, sync_wal);
             return r;
         } else if constexpr (std::is_same_v<T, InsertStmt>) {
             auto* r = exec_insert(s, params);
-            if (r->status == ZEPHYR_OK && log_wal && params.empty()) log_wal_entry(raw_sql);
+            if (r->status == ZEPHYR_OK && log_wal && params.empty()) log_wal_entry(raw_sql, sync_wal);
             return r;
         } else if constexpr (std::is_same_v<T, UpdateStmt>) {
             auto* r = exec_update(s, params);
-            if (r->status == ZEPHYR_OK && log_wal && params.empty()) log_wal_entry(raw_sql);
+            if (r->status == ZEPHYR_OK && log_wal && params.empty()) log_wal_entry(raw_sql, sync_wal);
             return r;
         } else if constexpr (std::is_same_v<T, DeleteStmt>) {
             auto* r = exec_delete(s, params);
-            if (r->status == ZEPHYR_OK && log_wal && params.empty()) log_wal_entry(raw_sql);
+            if (r->status == ZEPHYR_OK && log_wal && params.empty()) log_wal_entry(raw_sql, sync_wal);
             return r;
         } else if constexpr (std::is_same_v<T, SelectStmt>) {
             return exec_select(s, params, nullptr);
@@ -1214,14 +1798,16 @@ ZephyrResultSet* ZephyrEngine::exec_txn(const TxnStmt& s) {
             txn_backup_[k] = tbl->clone_data(&reaper_);
         }
         txn_wal_buffer_.clear();
-        in_txn_ = true;
+        in_txn_.store(true, std::memory_order_release);
+        active_txns_.fetch_add(1, std::memory_order_relaxed);
         return pack_result({}, {}, {}, 0, 0);
     }
     if (s.kind == TxnStmt::Kind::Commit) {
         if (!in_txn_) {
             return pack_result({}, {}, {}, 0, 0);
         }
-        in_txn_ = false;
+        in_txn_.store(false, std::memory_order_release);
+        active_txns_.fetch_sub(1, std::memory_order_relaxed);
         txn_backup_.clear();
         if (!in_replay_ && wal_.is_open()) {
             for (const auto& sql : txn_wal_buffer_) {
@@ -1251,6 +1837,7 @@ ZephyrResultSet* ZephyrEngine::exec_txn(const TxnStmt& s) {
     txn_backup_.clear();
     txn_wal_buffer_.clear();
     in_txn_.store(false, std::memory_order_release);
+    active_txns_.fetch_sub(1, std::memory_order_relaxed);
     return pack_result({}, {}, {}, 0, 0);
 }
 
@@ -1746,6 +2333,75 @@ Table* ZephyrEngine::resolve_table(
     return it != tables_.end() ? it->second.get() : nullptr;
 }
 
+std::unique_ptr<Table> ZephyrEngine::build_virtual_table(std::string_view lower_name) const {
+    auto add_col = [](Table& t, const char* name, ColumnType ty) {
+        size_t idx = t.schema.size();
+        ColumnSchema cs;
+        cs.name = name;
+        cs.type = ty;
+        t.col_map[to_lower(name)] = idx;
+        t.schema.push_back(std::move(cs));
+        ColumnData cd;
+        cd.type = ty;
+        t.columns.push_back(std::move(cd));
+    };
+
+    // Sort user tables by name for deterministic metadata output
+    std::vector<const Table*> sorted_tables;
+    sorted_tables.reserve(tables_.size());
+    for (const auto& [k, tbl] : tables_) {
+        if (tbl) sorted_tables.push_back(tbl.get());
+    }
+    std::sort(sorted_tables.begin(), sorted_tables.end(),
+              [](const Table* a, const Table* b) { return a->name < b->name; });
+
+    if (lower_name == "information_schema.tables" || lower_name == "pg_catalog.pg_tables") {
+        auto vt = std::make_unique<Table>();
+        vt->name = std::string(lower_name);
+        add_col(*vt, "table_schema", ColumnType::Text);
+        add_col(*vt, "table_name", ColumnType::Text);
+        add_col(*vt, "table_type", ColumnType::Text);
+        add_col(*vt, "row_count", ColumnType::I64);
+
+        for (const Table* tbl : sorted_tables) {
+            int64_t rcnt = tbl->btree ? static_cast<int64_t>(tbl->btree->total_count()) : 0;
+            vt->columns[0].push_value(Value::make_text("public"));
+            vt->columns[1].push_value(Value::make_text(tbl->name));
+            vt->columns[2].push_value(Value::make_text("BASE TABLE"));
+            vt->columns[3].push_value(Value::make_i64(rcnt));
+            vt->live.push_back(1);
+        }
+        return vt;
+    }
+
+    if (lower_name == "information_schema.columns") {
+        auto vt = std::make_unique<Table>();
+        vt->name = "information_schema.columns";
+        add_col(*vt, "table_name", ColumnType::Text);
+        add_col(*vt, "column_name", ColumnType::Text);
+        add_col(*vt, "ordinal_position", ColumnType::I64);
+        add_col(*vt, "data_type", ColumnType::Text);
+        add_col(*vt, "is_nullable", ColumnType::Text);
+        add_col(*vt, "is_primary_key", ColumnType::Bool);
+
+        for (const Table* tbl : sorted_tables) {
+            for (size_t c = 0; c < tbl->schema.size(); ++c) {
+                const ColumnSchema& cs = tbl->schema[c];
+                vt->columns[0].push_value(Value::make_text(tbl->name));
+                vt->columns[1].push_value(Value::make_text(cs.name));
+                vt->columns[2].push_value(Value::make_i64(static_cast<int64_t>(c + 1)));
+                vt->columns[3].push_value(Value::make_text(column_type_sql_name(cs.type)));
+                vt->columns[4].push_value(Value::make_text(cs.not_null ? "NO" : "YES"));
+                vt->columns[5].push_value(Value::make_bool(cs.primary_key));
+                vt->live.push_back(1);
+            }
+        }
+        return vt;
+    }
+
+    return nullptr;
+}
+
 // ============================================================================
 // SELECT Execution (O(1) B-Tree Fastpath, SIMD Scan, Hash Join, CTEs, GroupBy)
 // ============================================================================
@@ -1788,6 +2444,22 @@ ZephyrResultSet* ZephyrEngine::exec_select(
         }
         free_result(sub);
         cte_map[to_lower(cte.name)] = std::move(tmp);
+    }
+
+    // 1.5 Materialize virtual information_schema / pg_catalog system tables if referenced
+    auto maybe_add_virtual = [&](std::string_view tname) {
+        std::string lower = to_lower(tname);
+        if (is_virtual_system_table(lower) && !cte_map.count(lower)) {
+            if (auto vt = build_virtual_table(lower)) {
+                cte_map[lower] = std::move(vt);
+            }
+        }
+    };
+    if (s.from.has_value()) {
+        maybe_add_virtual(s.from->table_name);
+    }
+    for (const auto& jc : s.joins) {
+        maybe_add_virtual(jc.table.table_name);
     }
 
     // 2. O(1) / O(log N) AugmentedBTree Fastpath for single-table aggregates
@@ -1874,6 +2546,7 @@ ZephyrResultSet* ZephyrEngine::exec_select(
                 }
 
                 if (all_fast) {
+                    o1_fastpath_hits_.fetch_add(1, std::memory_order_relaxed);
                     return pack_result(fast_names, fast_types, {std::move(fast_vals)}, 0, ZEPHYR_FLAG_O1_FASTPATH);
                 }
             }
@@ -1881,7 +2554,7 @@ ZephyrResultSet* ZephyrEngine::exec_select(
     }
 
     // 2.5 Direct-to-Arena Fast Projection for simple single-table SELECT
-    if (s.ctes.empty() && !outer_ctes && s.from.has_value() && s.joins.empty() &&
+    if (cte_map.empty() && s.from.has_value() && s.joins.empty() &&
         s.group_by.empty() && !s.distinct && s.order_by.empty() && !s.items.empty()) {
         Table* base = resolve_table(s.from->table_name, nullptr);
         if (!base) {
@@ -1922,6 +2595,7 @@ ZephyrResultSet* ZephyrEngine::exec_select(
         }
 
         if (can_fast_project) {
+            std::shared_lock<std::shared_mutex> row_lk(base->rw_mu);
             auto matched = scan_matching_rows(*base, s.where.get(), params);
             size_t start_idx = 0;
             if (s.offset.has_value() && *s.offset > 0) {
@@ -2038,6 +2712,27 @@ ZephyrResultSet* ZephyrEngine::exec_select(
         if (!base) {
             return make_error_result(ZEPHYR_ERR_NOT_FOUND, "table not found: " + s.from->table_name);
         }
+
+        // Acquire per-table shared row locks for all real tables referenced in FROM / JOINs
+        std::vector<Table*> real_tables;
+        if (!cte_map.count(to_lower(s.from->table_name))) {
+            real_tables.push_back(base);
+        }
+        for (const auto& jc : s.joins) {
+            if (!cte_map.count(to_lower(jc.table.table_name))) {
+                if (Table* jt = resolve_table(jc.table.table_name, &cte_map)) {
+                    real_tables.push_back(jt);
+                }
+            }
+        }
+        std::sort(real_tables.begin(), real_tables.end());
+        real_tables.erase(std::unique(real_tables.begin(), real_tables.end()), real_tables.end());
+        std::vector<std::shared_lock<std::shared_mutex>> row_locks;
+        row_locks.reserve(real_tables.size());
+        for (Table* rt : real_tables) {
+            row_locks.emplace_back(rt->rw_mu);
+        }
+
         std::string base_qual = s.from->alias.empty() ? base->name : s.from->alias;
         for (const auto& cs : base->schema) {
             col_names.push_back(cs.name);

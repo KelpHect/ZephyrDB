@@ -5,6 +5,7 @@
 #include "zephyr/core/rcu.hpp"
 #include "zephyr/net/pgwire.hpp"
 #include "zephyr/net/raft.hpp"
+#include "zephyr/net/studio.hpp"
 #include "zephyr/sql/executor.hpp"
 #include "zephyr/sql/reflection.hpp"
 #include "zephyr/sql/simd_eval.hpp"
@@ -525,15 +526,162 @@ static void test_prepared_and_concurrent_sql() {
     zephyr_db_close(db);
 }
 
+static void test_concurrent_writes_pk_update_and_sys_tables() {
+    std::cout << "Running test_concurrent_writes_pk_update_and_sys_tables...\n";
+    fs::path dir = fs::temp_directory_path() / "zephyrdb_test_sync_wal";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    std::string dir_str = dir.string();
+
+    ZephyrConfig cfg = zephyr_default_config();
+    cfg.data_dir = dir_str.c_str();
+    cfg.wal_flush_ms = 2;
+    cfg.enable_wal = 1;
+    cfg.enable_compactor = 0;
+
+    ZephyrDB* db = zephyr_db_open(&cfg);
+    CHECK(db != nullptr);
+
+    for (int t = 0; t < 4; ++t) {
+        std::string ddl = "CREATE TABLE t" + std::to_string(t) + " (id BIGINT PRIMARY KEY, val BIGINT);";
+        CHECK(zephyr_exec(db, ddl.c_str(), nullptr) == ZEPHYR_OK);
+    }
+
+    // 4 concurrent writer threads writing to 4 distinct tables via per-table write_mu
+    std::atomic<int> write_errs{0};
+    std::vector<std::thread> writers;
+    for (int t = 0; t < 4; ++t) {
+        writers.emplace_back([&, t]() {
+            std::string sql = "INSERT INTO t" + std::to_string(t) + " VALUES ($1, $2);";
+            ZephyrStmt* st = zephyr_prepare(db, sql.c_str());
+            if (!st) {
+                write_errs.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            for (int i = 1; i <= 100; ++i) {
+                ZephyrValue p[2]{};
+                p[0].type = ZEPHYR_TYPE_I64; p[0].as.i64 = i;
+                p[1].type = ZEPHYR_TYPE_I64; p[1].as.i64 = i * 10;
+                uint64_t aff = 0;
+                if (zephyr_stmt_exec(st, p, 2, &aff) != ZEPHYR_OK || aff != 1) {
+                    write_errs.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            zephyr_stmt_free(st);
+        });
+    }
+    for (auto& w : writers) w.join();
+    CHECK(write_errs.load() == 0);
+
+    for (int t = 0; t < 4; ++t) {
+        std::string tn = "t" + std::to_string(t);
+        CHECK(zephyr_aggregate_count(db, tn.c_str()).count == 100);
+    }
+
+    // Precompiled PK point-update
+    ZephyrStmt* upd = zephyr_prepare(db, "UPDATE t0 SET val = val + $1 WHERE id = $2;");
+    CHECK(upd != nullptr);
+    ZephyrValue up_p[2]{};
+    up_p[0].type = ZEPHYR_TYPE_I64; up_p[0].as.i64 = 500;
+    up_p[1].type = ZEPHYR_TYPE_I64; up_p[1].as.i64 = 1;
+    uint64_t uaff = 0;
+    CHECK(zephyr_stmt_exec(upd, up_p, 2, &uaff) == ZEPHYR_OK && uaff == 1);
+    zephyr_stmt_free(upd);
+    CHECK(zephyr_aggregate_sum(db, "t0", "val").sum_i64 == (10LL * 100 * 101 / 2) + 500);
+
+    // Strict OS-flushed sync write
+    uint64_t saff = 0;
+    CHECK(zephyr_exec_sync(db, "INSERT INTO t0 VALUES (101, 999);", &saff) == ZEPHYR_OK && saff == 1);
+
+    // Virtual system tables
+    ZephyrResultSet* vt = zephyr_query(db, "SELECT table_name, row_count FROM information_schema.tables ORDER BY table_name;");
+    CHECK(vt != nullptr && vt->status == ZEPHYR_OK && vt->row_count == 4);
+    zephyr_result_free(vt);
+
+    ZephyrResultSet* vc = zephyr_query(db, "SELECT column_name, is_primary_key FROM information_schema.columns WHERE table_name = 't0';");
+    CHECK(vc != nullptr && vc->status == ZEPHYR_OK && vc->row_count == 2);
+    zephyr_result_free(vc);
+
+    ZephyrStats stats = zephyr_get_stats(db);
+    CHECK(stats.table_count == 4);
+    CHECK(stats.total_rows == 401);
+    CHECK(stats.wal_lsn > 0);
+    CHECK(stats.wal_flushed_lsn >= stats.wal_lsn);
+
+    zephyr_db_close(db);
+    fs::remove_all(dir);
+}
+
+static void test_studio_http_loopback() {
+    std::cout << "Running test_studio_http_loopback...\n";
+#if defined(_WIN32)
+    WSADATA wsa{};
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+    ZephyrConfig cfg = zephyr_default_config();
+    ZephyrDB* db = zephyr_db_open(&cfg);
+    CHECK(db != nullptr);
+    CHECK(zephyr_exec(db, "CREATE TABLE t0 (id BIGINT PRIMARY KEY, val BIGINT);", nullptr) == ZEPHYR_OK);
+    CHECK(zephyr_exec(db, "INSERT INTO t0 VALUES (1, 100), (2, 250);", nullptr) == ZEPHYR_OK);
+
+    zephyr::net::StudioServer studio;
+    CHECK(studio.start(db, 0));
+    uint16_t port = studio.bound_port();
+    CHECK(port > 0);
+
+    auto http_req = [&](const std::string& req) -> std::string {
+        z_sock_t sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (sock == Z_INVALID_SOCK) return "";
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        if (connect(sock, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0) {
+            z_close_sock(sock);
+            return "";
+        }
+        send_all(sock, reinterpret_cast<const uint8_t*>(req.data()), req.size());
+        std::string out;
+        char buf[2048];
+        for (;;) {
+            int r = recv(sock, buf, sizeof(buf), 0);
+            if (r <= 0) break;
+            out.append(buf, buf + r);
+        }
+        z_close_sock(sock);
+        return out;
+    };
+
+    std::string stats_resp = http_req("GET /api/stats HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    CHECK(stats_resp.find("200 OK") != std::string::npos);
+    CHECK(stats_resp.find("\"table_count\":1") != std::string::npos);
+
+    const std::string body = R"({"sql":"SELECT COUNT(*), SUM(val) FROM t0;"})";
+    std::string query_req = "POST /api/query HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: " +
+                            std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+    std::string query_resp = http_req(query_req);
+    CHECK(query_resp.find("200 OK") != std::string::npos);
+    CHECK(query_resp.find("\"o1_fastpath\":true") != std::string::npos);
+    CHECK(query_resp.find("350") != std::string::npos);
+
+    studio.stop();
+    zephyr_db_close(db);
+#if defined(_WIN32)
+    WSACleanup();
+#endif
+}
+
 int main() {
     test_arena();
     test_btree_and_rcu_concurrent();
     test_upsert_batch();
     test_sql_and_simd();
     test_prepared_and_concurrent_sql();
+    test_concurrent_writes_pk_update_and_sys_tables();
     test_persistence_wal_and_mmap();
     test_raft_cluster();
     test_pgwire_loopback();
+    test_studio_http_loopback();
 
     if (g_failures == 0) {
         std::cout << "\nALL ZEPHYRDB TESTS PASSED!\n";

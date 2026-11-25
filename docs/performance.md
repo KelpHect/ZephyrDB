@@ -35,13 +35,14 @@ Measured results from `zephyrdb_bench.exe` on Windows x64 (`MSVC 19.52`, `/std:c
 
 | Benchmark | Measured Result | Notes |
 | :--- | :--- | :--- |
-| **Arena Bump Allocation** (`24 B`, reset/16k) | **1.78 ns/op** | 64-byte aligned slab allocator |
-| **Augmented B-Tree Insert** (`100k` rows) | **215.63 ms** (`0.46 M ops/s`) | NodePool + O(1) incremental deltas |
-| **Augmented B-Tree `upsert_batch`** (`100k` rows) | **11.74 ms** (`8.52 M ops/s`) | O(N) bulk-load + `batch_gen` in-place mutation |
-| **Augmented B-Tree `O(1)` `COUNT` / `SUM`** (`100k` rows) | **2.42 ns/query** | Asymmetric RCU + root metadata (`ZEPHYR_FLAG_O1_FASTPATH`) |
-| **Augmented B-Tree `O(log N)` `range_sum`** (`50k`-key range) | **108.33 ns/query** | Branchless search + subtree aggregate pruning |
-| **SIMD Columnar Filter** (`100k` `int64_t`) | **5,970.33 M rows/sec** | 16-wide unrolled AVX2 + template-hoisted `CmpOp` |
-| **Lock-Free RCU Point Reads** (`4` threads) | **139.34 M reads/sec** | Asymmetric RCU (`FlushProcessWriteBuffers`) |
-| **SQL C-ABI `COUNT(*) + SUM(gold)` Roundtrip** | **2.09 µs/query** | Full SQL parse + O(1) exec + pooled Arena pack |
+| **Arena Bump Allocation** (`24 B`, reset/16k) | **1.91 ns/op** | 64-byte aligned slab allocator |
+| **Augmented B-Tree Insert** (`100k` rows) | **213.97 ms** (`0.47 M ops/s`) | NodePool + O(1) incremental deltas |
+| **Augmented B-Tree `upsert_batch`** (`100k` rows) | **8.16 ms** (`12.25 M ops/s`) | O(N) bulk-load + `batch_gen` in-place mutation |
+| **Augmented B-Tree `O(1)` `COUNT` / `SUM`** (`100k` rows) | **1.91 ns/query** | Asymmetric RCU + root metadata (`ZEPHYR_FLAG_O1_FASTPATH`) |
+| **Augmented B-Tree `O(log N)` `range_sum`** (`50k`-key range) | **94.46 ns/query** | Branchless search + subtree aggregate pruning |
+| **SIMD Columnar Filter** (`100k` `int64_t`) | **6,763.79 M rows/sec** | 16-wide unrolled AVX2 + template-hoisted `CmpOp` |
+| **Lock-Free RCU Point Reads** (`4` threads) | **179.13 M reads/sec** | Asymmetric RCU (`FlushProcessWriteBuffers`) |
+| **SQL C-ABI `COUNT(*) + SUM(gold)` Roundtrip** | **1.65 µs/query** | Full SQL parse + O(1) exec + pooled Arena pack |
 | **SQL Prepared `O(1)` `COUNT(*) + SUM(gold)`** (`zephyr_stmt_query`) | **0.05 µs/query** (`50 ns`) | Lock-free `CatalogSnapshot` + precompiled plan + pooled Arena |
-| **SQL Prepared Concurrent Reads** (`4` threads) | **34.83 M queries/sec** | 100% lock-free multi-core scaling |
+| **SQL Precompiled PK Point-Update** (`UPDATE ... WHERE id = $2`) | **1.82 µs/op** (`0.55 M updates/sec`) | Per-table `write_mu` + `pk_i64_index` + B-Tree upsert |
+| **Mixed MMORPG `2R + 2W` Workload** (separate tables) | **16.54 M ops/sec** | Concurrent lock-free reads + parallel table writes |

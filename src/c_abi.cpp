@@ -56,6 +56,17 @@ static_assert(offsetof(ZephyrConfig, arena_slab_bytes) == 8, "ZephyrConfig.arena
 static_assert(offsetof(ZephyrConfig, wal_flush_ms) == 16, "ZephyrConfig.wal_flush_ms offset");
 static_assert(offsetof(ZephyrConfig, enable_wal) == 20, "ZephyrConfig.enable_wal offset");
 static_assert(offsetof(ZephyrConfig, enable_compactor) == 24, "ZephyrConfig.enable_compactor offset");
+
+static_assert(sizeof(ZephyrStats) == 64, "ZephyrStats must be 64 bytes");
+static_assert(alignof(ZephyrStats) == 8, "ZephyrStats align must be 8");
+static_assert(offsetof(ZephyrStats, table_count) == 0, "ZephyrStats.table_count offset");
+static_assert(offsetof(ZephyrStats, total_rows) == 8, "ZephyrStats.total_rows offset");
+static_assert(offsetof(ZephyrStats, wal_lsn) == 16, "ZephyrStats.wal_lsn offset");
+static_assert(offsetof(ZephyrStats, wal_flushed_lsn) == 24, "ZephyrStats.wal_flushed_lsn offset");
+static_assert(offsetof(ZephyrStats, rcu_reclaimed) == 32, "ZephyrStats.rcu_reclaimed offset");
+static_assert(offsetof(ZephyrStats, o1_fastpath_hits) == 40, "ZephyrStats.o1_fastpath_hits offset");
+static_assert(offsetof(ZephyrStats, prepared_queries) == 48, "ZephyrStats.prepared_queries offset");
+static_assert(offsetof(ZephyrStats, active_txns) == 56, "ZephyrStats.active_txns offset");
 #endif
 
 struct ZephyrDB {
@@ -191,6 +202,20 @@ int32_t zephyr_checkpoint(ZephyrDB* db) {
         return ZEPHYR_ERR_INVALID_ARG;
     }
     return db->engine->checkpoint();
+}
+
+int32_t zephyr_exec_sync(ZephyrDB* db, const char* sql, uint64_t* rows_affected) {
+    if (!db || !db->engine || !sql) {
+        return ZEPHYR_ERR_INVALID_ARG;
+    }
+    return db->engine->execute_sync(sql, rows_affected);
+}
+
+ZephyrStats zephyr_get_stats(ZephyrDB* db) {
+    if (!db || !db->engine) {
+        return ZephyrStats{};
+    }
+    return db->engine->get_stats();
 }
 
 const char* zephyr_last_error(ZephyrDB* db) {

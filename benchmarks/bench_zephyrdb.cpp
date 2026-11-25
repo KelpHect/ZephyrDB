@@ -193,6 +193,72 @@ int main() {
         std::cout << "SQL Prepared concurrent reads (4 threads): "
                   << (sql_reads.load() / csec / 1e6) << " M queries/sec\n";
 
+        // 5d. Precompiled PK Point-Update
+        ZephyrStmt* upd = zephyr_prepare(db, "UPDATE items SET gold = gold + $1 WHERE id = $2;");
+        auto u0 = Clock::now();
+        for (int i = 0; i < Q; ++i) {
+            ZephyrValue p[2]{};
+            p[0].type = ZEPHYR_TYPE_I64; p[0].as.i64 = 1;
+            p[1].type = ZEPHYR_TYPE_I64; p[1].as.i64 = (i % 10000) + 1;
+            zephyr_stmt_exec(upd, p, 2, nullptr);
+        }
+        auto u1 = Clock::now();
+        double uus = std::chrono::duration<double, std::micro>(u1 - u0).count() / Q;
+        std::cout << "SQL Precompiled PK point-update: " << uus << " us/op (" << (1.0 / uus) << " M updates/sec)\n";
+        zephyr_stmt_free(upd);
+
+        // 5e. Mixed MMORPG Read+Write (2 Readers + 2 Writers on separate tables)
+        zephyr_exec(db, "CREATE TABLE items2 (id BIGINT PRIMARY KEY, gold BIGINT);", nullptr);
+        zephyr_exec(db, "BEGIN;", nullptr);
+        for (int i = 1; i <= 1000; ++i) {
+            std::string q = "INSERT INTO items2 VALUES (" + std::to_string(i) + ", " + std::to_string(i * 5) + ");";
+            zephyr_exec(db, q.c_str(), nullptr);
+        }
+        zephyr_exec(db, "COMMIT;", nullptr);
+
+        ZephyrStmt* r_stmt = zephyr_prepare(db, "SELECT COUNT(*), SUM(gold) FROM items;");
+        ZephyrStmt* w1 = zephyr_prepare(db, "UPDATE items SET gold = gold + $1 WHERE id = $2;");
+        ZephyrStmt* w2 = zephyr_prepare(db, "UPDATE items2 SET gold = gold + $1 WHERE id = $2;");
+        std::atomic<bool> stop_mix{false};
+        std::atomic<uint64_t> mix_ops{0};
+        std::vector<std::thread> mix_threads;
+        auto m0 = Clock::now();
+        for (int t = 0; t < 2; ++t) {
+            mix_threads.emplace_back([&]() {
+                uint64_t local = 0;
+                while (!stop_mix.load(std::memory_order_acquire)) {
+                    ZephyrResultSet* rs = zephyr_stmt_query(r_stmt, nullptr, 0);
+                    if (rs) ++local;
+                    zephyr_result_free(rs);
+                }
+                mix_ops.fetch_add(local, std::memory_order_relaxed);
+            });
+        }
+        for (int t = 0; t < 2; ++t) {
+            ZephyrStmt* ws = (t == 0) ? w1 : w2;
+            mix_threads.emplace_back([&, ws]() {
+                uint64_t local = 0;
+                int idx = 1;
+                while (!stop_mix.load(std::memory_order_acquire)) {
+                    ZephyrValue p[2]{};
+                    p[0].type = ZEPHYR_TYPE_I64; p[0].as.i64 = 1;
+                    p[1].type = ZEPHYR_TYPE_I64; p[1].as.i64 = (idx % 1000) + 1;
+                    if (zephyr_stmt_exec(ws, p, 2, nullptr) == ZEPHYR_OK) ++local;
+                    ++idx;
+                }
+                mix_ops.fetch_add(local, std::memory_order_relaxed);
+            });
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        stop_mix.store(true, std::memory_order_release);
+        for (auto& th : mix_threads) th.join();
+        auto m1 = Clock::now();
+        double msec = std::chrono::duration<double>(m1 - m0).count();
+        std::cout << "Mixed MMORPG 2R+2W throughput: " << (mix_ops.load() / msec / 1e6) << " M ops/sec\n";
+
+        zephyr_stmt_free(r_stmt);
+        zephyr_stmt_free(w1);
+        zephyr_stmt_free(w2);
         zephyr_stmt_free(stmt);
         zephyr_db_close(db);
     }

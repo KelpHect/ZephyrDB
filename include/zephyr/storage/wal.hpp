@@ -63,9 +63,14 @@ public:
     bool open(const std::string& wal_path, uint32_t flush_ms = 2);
     void close();
 
-    /// Enqueue a WAL record. If `sync_wait` is true, blocks until flushed to disk.
+    /// Enqueue a WAL record. If `sync_wait` is true, blocks until durably flushed to disk.
     /// Returns the assigned LSN (or 0 if WAL is not open).
     uint64_t append(uint8_t op, std::string_view sql, bool sync_wait = false);
+
+    /// Enqueue a binary WAL record sharing the same framing and CRC32 checksums.
+    /// If `sync_wait` is true, blocks until durably flushed to disk.
+    /// Returns the assigned LSN (or 0 if WAL is not open).
+    uint64_t append_binary(uint8_t op, const uint8_t* payload, size_t len, bool sync_wait = false);
 
     /// Force-flush all queued records to disk and wait for completion.
     void flush();
@@ -96,12 +101,14 @@ private:
     std::condition_variable wake_cv_;
     std::condition_variable flush_cv_;
     bool wake_requested_{false};
+    bool sync_requested_{false};
 
     cpp26::execution::thread_pool_scheduler sched_{1};
     std::atomic<bool> open_{false};
     std::atomic<bool> running_{false};
     std::atomic<uint64_t> next_lsn_{1};
     std::atomic<uint64_t> flushed_lsn_{0};
+    std::atomic<uint64_t> synced_lsn_{0};
 };
 
 } // namespace zephyr::storage

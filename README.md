@@ -60,15 +60,16 @@ Measured on Windows x64 (`MSVC 19.52`, `/std:c++latest /O2 /arch:AVX2`, `zephyrd
 
 | Benchmark | Measured Result | Notes |
 | --- | --- | --- |
-| **Arena Bump Allocation** (24 B, reset/16k) | **1.78 ns/op** | 64-byte aligned slab allocator |
-| **Augmented B-Tree `upsert_batch`** (100k rows) | **11.74 ms (8.52 M ops/s)** | O(N) bulk-load + `batch_gen` in-place mutation |
-| **Augmented B-Tree `O(1)` `COUNT` / `SUM`** (100k rows) | **2.42 ns/query** | Asymmetric RCU + root metadata (`ZEPHYR_FLAG_O1_FASTPATH`) |
-| **Augmented B-Tree `O(log N)` `range_sum`** (50k-key range) | **108.33 ns/query** | Branchless search + subtree aggregate pruning |
-| **SIMD Columnar Filter** (`100k` `int64_t`) | **5,970.33 M rows/sec** | 16-wide unrolled AVX2 + template-hoisted `CmpOp` |
-| **Lock-Free RCU Point Reads** (4 threads) | **139.34 M reads/sec** | Asymmetric RCU (`FlushProcessWriteBuffers`) |
-| **SQL C-ABI `COUNT(*) + SUM(gold)` Roundtrip** | **2.09 µs/query** | Full SQL parse + O(1) exec + pooled Arena pack |
+| **Arena Bump Allocation** (24 B, reset/16k) | **1.91 ns/op** | 64-byte aligned slab allocator |
+| **Augmented B-Tree `upsert_batch`** (100k rows) | **8.16 ms (12.25 M ops/s)** | O(N) bulk-load + `batch_gen` in-place mutation |
+| **Augmented B-Tree `O(1)` `COUNT` / `SUM`** (100k rows) | **1.91 ns/query** | Asymmetric RCU + root metadata (`ZEPHYR_FLAG_O1_FASTPATH`) |
+| **Augmented B-Tree `O(log N)` `range_sum`** (50k-key range) | **94.46 ns/query** | Branchless search + subtree aggregate pruning |
+| **SIMD Columnar Filter** (`100k` `int64_t`) | **6,763.79 M rows/sec** | 16-wide unrolled AVX2 + template-hoisted `CmpOp` |
+| **Lock-Free RCU Point Reads** (4 threads) | **179.13 M reads/sec** | Asymmetric RCU (`FlushProcessWriteBuffers`) |
+| **SQL C-ABI `COUNT(*) + SUM(gold)` Roundtrip** | **1.65 µs/query** | Full SQL parse + O(1) exec + pooled Arena pack |
 | **SQL Prepared `O(1)` `COUNT(*) + SUM(gold)`** (`zephyr_stmt_query`) | **0.05 µs/query** (`50 ns`) | Lock-free `CatalogSnapshot` + precompiled plan + pooled Arena |
-| **SQL Prepared Concurrent Reads** (4 threads) | **34.83 M queries/sec** | 100% lock-free multi-core scaling |
+| **SQL Precompiled PK Point-Update** | **1.82 µs/op (0.55 M updates/sec)** | Per-table `write_mu` + `pk_i64_index` |
+| **Mixed MMORPG `2R + 2W` Workload** | **16.54 M ops/sec** | Lock-free reads + parallel per-table writes |
 
 ---
 
@@ -143,16 +144,16 @@ dotnet run -c Release --project bindings/unity/ZephyrDB.Tests
 - TypeScript linear-memory wrapper: [bindings/wasm/zephyrdb.ts](bindings/wasm/zephyrdb.ts)
 - Rust FFI crate: [bindings/rust/src/lib.rs](bindings/rust/src/lib.rs) (`cargo check --manifest-path bindings/rust/Cargo.toml`)
 
-### 5. Node.js Website Backend & Standalone Server (PGWire v3.0 + Raft)
+### 5. Node.js Website Backend, Zephyr Studio & Standalone Server
 
-Connect from any Node.js/TypeScript backend using [bindings/node/index.mjs](bindings/node/index.mjs) (`ZephyrPgClient` with Simple & Extended Query `$1` support, plus optional N-API embedded addon) or any Postgres client (`psql -h 127.0.0.1 -p 5432 -U postgres`):
+Connect from any Node.js/TypeScript backend using [bindings/node/index.mjs](bindings/node/index.mjs) (`ZephyrPgClient` with Simple & Extended Query `$1` support, plus optional N-API embedded addon) or any Postgres client (`psql -h 127.0.0.1 -p 5432 -U postgres`), and inspect live tables & metrics in your browser via **Zephyr Studio** (`--studio-port 8080`):
 
 ```powershell
-.\build\zephyrdb_server.exe --data-dir ./shard_1 --pgwire-port 5432 --raft-id 1 --raft-port 7001 --peers "1@127.0.0.1:7001,2@127.0.0.1:7002"
+.\build\zephyrdb_server.exe --data-dir ./shard_1 --pgwire-port 5432 --studio-port 8080 --raft-id 1 --raft-port 7001 --peers "1@127.0.0.1:7001,2@127.0.0.1:7002"
 node bindings/node/test/test_node.mjs
 ```
 
-See [docs/node-backend.md](docs/node-backend.md) and [bindings/node/examples/http_leaderboard.mjs](bindings/node/examples/http_leaderboard.mjs) for a complete REST API example.
+See [docs/studio.md](docs/studio.md), [docs/node-backend.md](docs/node-backend.md), and [bindings/node/examples/http_leaderboard.mjs](bindings/node/examples/http_leaderboard.mjs).
 
 ---
 
