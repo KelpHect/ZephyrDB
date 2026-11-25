@@ -671,6 +671,51 @@ static void test_studio_http_loopback() {
 #endif
 }
 
+static void test_same_table_sharded_pk_updates() {
+    std::cout << "Running test_same_table_sharded_pk_updates...\n";
+    ZephyrConfig cfg = zephyr_default_config();
+    ZephyrDB* db = zephyr_db_open(&cfg);
+    CHECK(db != nullptr);
+    CHECK(zephyr_exec(db, "CREATE TABLE hot (id BIGINT PRIMARY KEY, gold BIGINT);", nullptr) == ZEPHYR_OK);
+    CHECK(zephyr_exec(db, "BEGIN;", nullptr) == ZEPHYR_OK);
+    ZephyrStmt* ins = zephyr_prepare(db, "INSERT INTO hot VALUES ($1, $2);");
+    for (int i = 1; i <= 800; ++i) {
+        ZephyrValue p[2]{};
+        p[0].type = ZEPHYR_TYPE_I64; p[0].as.i64 = i;
+        p[1].type = ZEPHYR_TYPE_I64; p[1].as.i64 = 0;
+        zephyr_stmt_exec(ins, p, 2, nullptr);
+    }
+    zephyr_stmt_free(ins);
+    CHECK(zephyr_exec(db, "COMMIT;", nullptr) == ZEPHYR_OK);
+
+    ZephyrStmt* upd = zephyr_prepare(db, "UPDATE hot SET gold = gold + $1 WHERE id = $2;");
+    CHECK(upd != nullptr);
+
+    std::atomic<int> errs{0};
+    std::vector<std::thread> writers;
+    for (int t = 0; t < 4; ++t) {
+        writers.emplace_back([&, t]() {
+            for (int iter = 0; iter < 50; ++iter) {
+                for (int k = t * 200 + 1; k <= (t + 1) * 200; ++k) {
+                    ZephyrValue p[2]{};
+                    p[0].type = ZEPHYR_TYPE_I64; p[0].as.i64 = 1;
+                    p[1].type = ZEPHYR_TYPE_I64; p[1].as.i64 = k;
+                    uint64_t aff = 0;
+                    if (zephyr_stmt_exec(upd, p, 2, &aff) != ZEPHYR_OK || aff != 1) {
+                        errs.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+        });
+    }
+    for (auto& w : writers) w.join();
+    CHECK(errs.load() == 0);
+    CHECK(zephyr_aggregate_sum(db, "hot", "gold").sum_i64 == 800LL * 50LL);
+
+    zephyr_stmt_free(upd);
+    zephyr_db_close(db);
+}
+
 int main() {
     test_arena();
     test_btree_and_rcu_concurrent();
@@ -678,6 +723,7 @@ int main() {
     test_sql_and_simd();
     test_prepared_and_concurrent_sql();
     test_concurrent_writes_pk_update_and_sys_tables();
+    test_same_table_sharded_pk_updates();
     test_persistence_wal_and_mmap();
     test_raft_cluster();
     test_pgwire_loopback();

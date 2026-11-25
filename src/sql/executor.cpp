@@ -492,7 +492,7 @@ std::unique_ptr<Table> Table::clone_data(zephyr::core::RcuReaper* reaper) const 
     copy->next_row_id = next_row_id;
     copy->pk_i64_index = pk_i64_index;
     copy->pk_str_index = pk_str_index;
-    copy->btree = std::make_unique<zephyr::core::AugmentedBTree>(reaper);
+    copy->btree = std::make_unique<zephyr::core::ShardedAugmentedBTree>(reaper);
     return copy;
 }
 
@@ -547,9 +547,19 @@ ZephyrEngine::~ZephyrEngine() {
     mmap_store_.close_mmap();
     CatalogSnapshot* snap = catalog_snap_.exchange(nullptr, std::memory_order_acq_rel);
     delete snap;
+    StmtCacheSnapshot* sc_snap = stmt_cache_snap_.exchange(nullptr, std::memory_order_acq_rel);
+    delete sc_snap;
     tables_.clear();
     txn_backup_.clear();
     reaper_.stop();
+}
+
+uint32_t ZephyrEngine::stat_slot() noexcept {
+    thread_local uint32_t tl_slot = UINT32_MAX;
+    if (tl_slot == UINT32_MAX) {
+        tl_slot = next_stat_slot_.fetch_add(1, std::memory_order_relaxed) & 63u;
+    }
+    return tl_slot;
 }
 
 void ZephyrEngine::publish_catalog_snapshot() {
@@ -629,12 +639,51 @@ ZephyrResultSet* ZephyrEngine::query(
     const ZephyrValue* params,
     uint32_t param_count
 ) {
-    clear_error();
-    ParseResult parsed = parse_sql(sql);
-    if (!parsed.ok()) {
-        return make_error_result(ZEPHYR_ERR_SYNTAX, parsed.error);
+    // Fastpath: lock-free RCU lookup in automatic statement cache (zero std::string allocation on hit)
+    {
+        std::shared_ptr<PreparedStmt> cached;
+        {
+            cpp26::rcu::scoped_read_lock rcu_guard(reaper_.domain());
+            const StmtCacheSnapshot* snap = stmt_cache_snap_.load(std::memory_order_acquire);
+            if (snap) {
+                auto it = snap->entries.find(sql);
+                if (it != snap->entries.end()) {
+                    cached = it->second;
+                }
+            }
+        }
+        if (cached) {
+            return query_prepared(*cached, params, param_count);
+        }
     }
-    return execute_stmts(sql, parsed.stmts, params, param_count, false);
+
+    // Cache miss: parse and compile via prepare(sql)
+    std::unique_ptr<PreparedStmt> ps = prepare(sql);
+    if (!ps) {
+        return make_error_result(ZEPHYR_ERR_SYNTAX, last_error());
+    }
+
+    if (ps->stmts.size() == 1 && !in_replay_) {
+        std::shared_ptr<PreparedStmt> sp(std::move(ps));
+        {
+            std::lock_guard<std::mutex> lk(stmt_cache_mu_);
+            StmtCacheSnapshot* old = stmt_cache_snap_.load(std::memory_order_relaxed);
+            if (!old || old->entries.find(sp->sql) == old->entries.end()) {
+                auto* next = new StmtCacheSnapshot();
+                if (old && old->entries.size() < STMT_CACHE_MAX_ENTRIES) {
+                    next->entries = old->entries;
+                }
+                next->entries.emplace(sp->sql, sp);
+                StmtCacheSnapshot* prev = stmt_cache_snap_.exchange(next, std::memory_order_acq_rel);
+                if (prev) {
+                    reaper_.retire_obj(prev);
+                }
+            }
+        }
+        return query_prepared(*sp, params, param_count);
+    }
+
+    return execute_stmts(ps->sql, ps->stmts, params, param_count, false);
 }
 
 std::unique_ptr<PreparedStmt> ZephyrEngine::prepare(std::string_view sql) {
@@ -875,6 +924,82 @@ bool ZephyrEngine::try_exec_pk_update_plan(
         return false;
     }
 
+    const ColumnSchema& cs = tbl->schema[target_cidx];
+    const bool is_pod_col = (cs.type == ColumnType::I64 ||
+                             cs.type == ColumnType::F64 ||
+                             cs.type == ColumnType::Bool);
+
+    if (is_pod_col) {
+        // Intra-table sharded concurrent PK point-update:
+        // shared_lock(tbl->rw_mu) keeps pk_i64_index & column vector buffers stable
+        // while per-shard mutexes allow 8 concurrent updates on different shards.
+        std::shared_lock<std::shared_mutex> tbl_rw_lk(tbl->rw_mu);
+
+        auto pit = tbl->pk_i64_index.find(pk_val);
+        if (pit == tbl->pk_i64_index.end()) {
+            out_status = ZEPHYR_OK;
+            out_affected = 0;
+            return true;
+        }
+
+        const size_t r = pit->second;
+        const size_t shard = zephyr::core::ShardedAugmentedBTree::shard_for_key(pk_val);
+        std::lock_guard<std::mutex> shard_lk(tbl->row_shard_mu[shard]);
+
+        ColumnData& cdata = tbl->columns[target_cidx];
+
+        Value new_val;
+        if (plan.is_delta) {
+            if (cdata.nulls[r] || rhs_val.is_null()) {
+                new_val = Value::make_null();
+            } else if (cs.type == ColumnType::I64 && rhs_val.type == ColumnType::I64) {
+                int64_t delta = plan.is_sub ? -rhs_val.i64 : rhs_val.i64;
+                new_val = Value::make_i64(cdata.i64_data[r] + delta);
+            } else if (cs.type == ColumnType::F64 &&
+                       (rhs_val.type == ColumnType::F64 || rhs_val.type == ColumnType::I64)) {
+                double d = (rhs_val.type == ColumnType::F64)
+                    ? rhs_val.f64 : static_cast<double>(rhs_val.i64);
+                if (plan.is_sub) d = -d;
+                new_val = Value::make_f64(cdata.f64_data[r] + d);
+            } else {
+                return false;
+            }
+        } else {
+            std::string err;
+            new_val = coerce_value(rhs_val, cs.type, err);
+            if (!err.empty()) {
+                set_error(err);
+                out_status = ZEPHYR_ERR_INVALID_ARG;
+                return true;
+            }
+        }
+
+        if (cs.not_null && new_val.is_null()) {
+            set_error("NULL violates NOT NULL");
+            out_status = ZEPHYR_ERR_CONSTRAINT;
+            return true;
+        }
+
+        cdata.set_value(r, new_val);
+        update_btree_for_row(*tbl, r);
+
+        if (!in_replay_ && wal_.is_open()) {
+            if (param_count == 0) {
+                log_wal_entry(stmt.sql, false);
+            } else {
+                std::string wal_sql = "UPDATE " + tbl->name + " SET " + cs.name + " = " +
+                                      format_sql_literal(new_val) + " WHERE " +
+                                      tbl->schema[tbl->pk_col].name + " = " +
+                                      std::to_string(pk_val);
+                log_wal_entry(wal_sql, false);
+            }
+        }
+
+        out_status = ZEPHYR_OK;
+        out_affected = 1;
+        return true;
+    }
+
     std::lock_guard<std::mutex> tbl_lk(tbl->write_mu);
     std::unique_lock<std::shared_mutex> row_lk(tbl->rw_mu);
 
@@ -886,7 +1011,6 @@ bool ZephyrEngine::try_exec_pk_update_plan(
     }
 
     const size_t r = pit->second;
-    const ColumnSchema& cs = tbl->schema[target_cidx];
     ColumnData& cdata = tbl->columns[target_cidx];
 
     Value new_val;
@@ -1085,7 +1209,7 @@ ZephyrResultSet* ZephyrEngine::query_prepared(
     uint32_t param_count
 ) {
     clear_error();
-    prepared_queries_.fetch_add(1, std::memory_order_relaxed);
+    stats_slots_[stat_slot()].prep_queries.fetch_add(1, std::memory_order_relaxed);
 
     // Lock-free RCU O(1) fastpath: zero shared_mutex, zero std::vector/std::string allocations
     if (stmt.o1_plan.has_value() && !in_txn_.load(std::memory_order_acquire)) {
@@ -1141,7 +1265,7 @@ ZephyrResultSet* ZephyrEngine::query_prepared(
             }
 
             if (ok) {
-                o1_fastpath_hits_.fetch_add(1, std::memory_order_relaxed);
+                stats_slots_[stat_slot()].o1_hits.fetch_add(1, std::memory_order_relaxed);
                 auto* arena = acquire_arena(static_cast<size_t>(config_.arena_slab_bytes));
                 auto* rs = arena->create<ZephyrResultSet>();
                 rs->_arena_handle = arena;
@@ -1211,7 +1335,7 @@ int32_t ZephyrEngine::exec_prepared(
     if (!in_txn_.load(std::memory_order_acquire)) {
         if (stmt.pk_update_plan.has_value()) {
             clear_error();
-            prepared_queries_.fetch_add(1, std::memory_order_relaxed);
+            stats_slots_[stat_slot()].prep_queries.fetch_add(1, std::memory_order_relaxed);
             int32_t st = ZEPHYR_OK;
             uint64_t affected = 0;
             if (try_exec_pk_update_plan(stmt, params, param_count, st, affected)) {
@@ -1228,7 +1352,7 @@ int32_t ZephyrEngine::exec_prepared(
         }
         if (stmt.pk_insert_plan.has_value()) {
             clear_error();
-            prepared_queries_.fetch_add(1, std::memory_order_relaxed);
+            stats_slots_[stat_slot()].prep_queries.fetch_add(1, std::memory_order_relaxed);
             int32_t st = ZEPHYR_OK;
             uint64_t affected = 0;
             if (try_exec_pk_insert_plan(stmt, params, param_count, st, affected)) {
@@ -1355,7 +1479,7 @@ ZephyrAggregate ZephyrEngine::aggregate_count(std::string_view table_name) {
     }
     agg.count = static_cast<int64_t>(tbl->btree->total_count());
     agg.status = ZEPHYR_OK;
-    o1_fastpath_hits_.fetch_add(1, std::memory_order_relaxed);
+    stats_slots_[stat_slot()].o1_hits.fetch_add(1, std::memory_order_relaxed);
     return agg;
 }
 
@@ -1402,7 +1526,7 @@ ZephyrAggregate ZephyrEngine::aggregate_sum(std::string_view table_name, std::st
                 agg.count = static_cast<int64_t>(tbl2->btree->total_count());
             }
             agg.status = ZEPHYR_OK;
-            o1_fastpath_hits_.fetch_add(1, std::memory_order_relaxed);
+            stats_slots_[stat_slot()].o1_hits.fetch_add(1, std::memory_order_relaxed);
             return agg;
         } else if (cs.type == ColumnType::I64 || cs.type == ColumnType::F64) {
             need_fallback_scan = true;
@@ -1463,8 +1587,14 @@ ZephyrStats ZephyrEngine::get_stats() const {
         stats.wal_flushed_lsn = wal_.flushed_lsn();
     }
     stats.rcu_reclaimed = reaper_.reclaimed_total();
-    stats.o1_fastpath_hits = o1_fastpath_hits_.load(std::memory_order_relaxed);
-    stats.prepared_queries = prepared_queries_.load(std::memory_order_relaxed);
+    uint64_t o1_total = 0;
+    uint64_t prep_total = 0;
+    for (const auto& slot : stats_slots_) {
+        o1_total += slot.o1_hits.load(std::memory_order_relaxed);
+        prep_total += slot.prep_queries.load(std::memory_order_relaxed);
+    }
+    stats.o1_fastpath_hits = o1_total;
+    stats.prepared_queries = prep_total;
     stats.active_txns = active_txns_.load(std::memory_order_relaxed);
     return stats;
 }
@@ -1852,7 +1982,7 @@ ZephyrResultSet* ZephyrEngine::exec_create_table(const CreateTableStmt& s) {
 
     auto tbl = std::make_unique<Table>();
     tbl->name = s.table_name;
-    tbl->btree = std::make_unique<zephyr::core::AugmentedBTree>(&reaper_);
+    tbl->btree = std::make_unique<zephyr::core::ShardedAugmentedBTree>(&reaper_);
 
     int agg_slot = 0;
     for (size_t i = 0; i < s.columns.size(); ++i) {
@@ -2425,7 +2555,7 @@ ZephyrResultSet* ZephyrEngine::exec_select(
         }
         auto tmp = std::make_unique<Table>();
         tmp->name = cte.name;
-        tmp->btree = std::make_unique<zephyr::core::AugmentedBTree>(&reaper_);
+        tmp->btree = std::make_unique<zephyr::core::ShardedAugmentedBTree>(&reaper_);
         for (uint64_t c = 0; c < sub->col_count; ++c) {
             ColumnSchema cs;
             cs.name = std::string(sub->columns[c].name, sub->columns[c].name_len);
@@ -2546,7 +2676,7 @@ ZephyrResultSet* ZephyrEngine::exec_select(
                 }
 
                 if (all_fast) {
-                    o1_fastpath_hits_.fetch_add(1, std::memory_order_relaxed);
+                    stats_slots_[stat_slot()].o1_hits.fetch_add(1, std::memory_order_relaxed);
                     return pack_result(fast_names, fast_types, {std::move(fast_vals)}, 0, ZEPHYR_FLAG_O1_FASTPATH);
                 }
             }
@@ -3222,7 +3352,7 @@ bool ZephyrEngine::load_snapshot(const std::string& snap_path) {
 
         auto tbl = std::make_unique<Table>();
         tbl->name = tname;
-        tbl->btree = std::make_unique<zephyr::core::AugmentedBTree>(&reaper_);
+        tbl->btree = std::make_unique<zephyr::core::ShardedAugmentedBTree>(&reaper_);
         int agg_slot = 0;
 
         for (uint32_t c = 0; c < col_count; ++c) {

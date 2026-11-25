@@ -256,6 +256,34 @@ int main() {
         double msec = std::chrono::duration<double>(m1 - m0).count();
         std::cout << "Mixed MMORPG 2R+2W throughput: " << (mix_ops.load() / msec / 1e6) << " M ops/sec\n";
 
+        // 5f. Same-Table Sharded PK Point-Updates (4 threads on 1 hot table)
+        std::atomic<bool> stop_sharded{false};
+        std::atomic<uint64_t> sharded_ops{0};
+        std::vector<std::thread> swriters;
+        auto s0 = Clock::now();
+        for (int t = 0; t < 4; ++t) {
+            swriters.emplace_back([&, t]() {
+                uint64_t local = 0;
+                int k = t * 2500 + 1;
+                while (!stop_sharded.load(std::memory_order_acquire)) {
+                    ZephyrValue p[2]{};
+                    p[0].type = ZEPHYR_TYPE_I64; p[0].as.i64 = 1;
+                    p[1].type = ZEPHYR_TYPE_I64; p[1].as.i64 = k;
+                    if (zephyr_stmt_exec(w1, p, 2, nullptr) == ZEPHYR_OK) ++local;
+                    ++k;
+                    if (k > (t + 1) * 2500) k = t * 2500 + 1;
+                }
+                sharded_ops.fetch_add(local, std::memory_order_relaxed);
+            });
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        stop_sharded.store(true, std::memory_order_release);
+        for (auto& th : swriters) th.join();
+        auto s1 = Clock::now();
+        double ssec = std::chrono::duration<double>(s1 - s0).count();
+        std::cout << "Same-table sharded PK updates (4 threads): "
+                  << (sharded_ops.load() / ssec / 1e6) << " M updates/sec\n";
+
         zephyr_stmt_free(r_stmt);
         zephyr_stmt_free(w1);
         zephyr_stmt_free(w2);

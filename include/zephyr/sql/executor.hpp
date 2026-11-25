@@ -9,6 +9,7 @@
 #include "zephyr/storage/mmap_store.hpp"
 #include "zephyr/storage/wal.hpp"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -77,9 +78,11 @@ struct Table {
 
     std::unordered_map<int64_t, size_t> pk_i64_index;
     std::unordered_map<std::string, size_t> pk_str_index;
-    std::unique_ptr<zephyr::core::AugmentedBTree> btree;
+    std::unique_ptr<zephyr::core::ShardedAugmentedBTree> btree;
     mutable std::mutex write_mu;
     mutable std::shared_mutex rw_mu;
+    static constexpr size_t WRITE_SHARDS = 8;
+    mutable std::array<std::mutex, WRITE_SHARDS> row_shard_mu;
 
     std::unique_ptr<Table> clone_data(zephyr::core::RcuReaper* reaper) const;
     int find_col(std::string_view col_name) const;
@@ -130,6 +133,28 @@ struct PreparedStmt {
     std::optional<CompiledO1Plan> o1_plan;
     std::optional<CompiledPkUpdatePlan> pk_update_plan;
     std::optional<CompiledPkInsertPlan> pk_insert_plan;
+};
+
+struct TransparentStringHash {
+    using is_transparent = void;
+    size_t operator()(std::string_view sv) const noexcept {
+        return std::hash<std::string_view>{}(sv);
+    }
+    size_t operator()(const std::string& s) const noexcept {
+        return std::hash<std::string_view>{}(s);
+    }
+};
+
+struct TransparentStringEq {
+    using is_transparent = void;
+    bool operator()(std::string_view a, std::string_view b) const noexcept {
+        return a == b;
+    }
+};
+
+struct StmtCacheSnapshot {
+    std::unordered_map<std::string, std::shared_ptr<PreparedStmt>,
+                       TransparentStringHash, TransparentStringEq> entries;
 };
 
 class ZephyrEngine {
@@ -274,6 +299,10 @@ private:
     std::unordered_map<std::string, std::unique_ptr<Table>> tables_;
     std::atomic<CatalogSnapshot*> catalog_snap_{nullptr};
 
+    static constexpr size_t STMT_CACHE_MAX_ENTRIES = 512;
+    std::atomic<StmtCacheSnapshot*> stmt_cache_snap_{nullptr};
+    std::mutex stmt_cache_mu_;
+
     std::atomic<bool> in_txn_{false};
     bool in_replay_{false};
     std::unordered_map<std::string, std::unique_ptr<Table>> txn_backup_;
@@ -284,8 +313,14 @@ private:
     std::string last_error_;
     std::string last_json_;
 
-    std::atomic<uint64_t> o1_fastpath_hits_{0};
-    std::atomic<uint64_t> prepared_queries_{0};
+    struct alignas(64) CounterSlot {
+        std::atomic<uint64_t> o1_hits{0};
+        std::atomic<uint64_t> prep_queries{0};
+    };
+    std::array<CounterSlot, 64> stats_slots_{};
+    std::atomic<uint32_t> next_stat_slot_{0};
+    uint32_t stat_slot() noexcept;
+
     std::atomic<uint64_t> active_txns_{0};
 };
 
