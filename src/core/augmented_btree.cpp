@@ -4,6 +4,34 @@
 
 namespace zephyr::core {
 
+namespace {
+
+// Branchless binary search for small sorted arrays (up to ORDER = 32 keys).
+// Compiles to cmp + cmov with zero branch mispredictions.
+inline size_t fast_lower_bound(const int64_t* keys, size_t n, int64_t key) noexcept {
+    size_t base = 0;
+    size_t len = n;
+    while (len > 1) {
+        size_t half = len >> 1;
+        base += (keys[base + half] < key) ? half : 0;
+        len -= half;
+    }
+    return base + (len > 0 && keys[base] < key ? 1 : 0);
+}
+
+inline size_t fast_upper_bound(const int64_t* keys, size_t n, int64_t key) noexcept {
+    size_t base = 0;
+    size_t len = n;
+    while (len > 1) {
+        size_t half = len >> 1;
+        base += (keys[base + half] <= key) ? half : 0;
+        len -= half;
+    }
+    return base + (len > 0 && keys[base] <= key ? 1 : 0);
+}
+
+} // namespace
+
 AugmentedBTree::NodePool::NodePool() {
     free_list_.reserve(256);
 }
@@ -36,6 +64,7 @@ void AugmentedBTree::NodePool::recycle_node(Node* n) noexcept {
     n->refcount.store(1, std::memory_order_relaxed);
     n->is_leaf = true;
     n->num_keys = 0;
+    n->batch_gen = 0;
     n->count = 0;
     n->min_key = INT64_MAX;
     n->max_key = INT64_MIN;
@@ -106,11 +135,12 @@ void AugmentedBTree::retire_root(Node* old_root) {
     }
 }
 
-AugmentedBTree::Node* AugmentedBTree::clone_node(const Node* src) {
+AugmentedBTree::Node* AugmentedBTree::clone_node(const Node* src, uint64_t batch_gen) {
     Node* dst = alloc_node();
     dst->refcount.store(1, std::memory_order_relaxed);
     dst->is_leaf = src->is_leaf;
     dst->num_keys = src->num_keys;
+    dst->batch_gen = batch_gen;
     dst->count = src->count;
     dst->min_key = src->min_key;
     dst->max_key = src->max_key;
@@ -175,18 +205,14 @@ bool AugmentedBTree::find(int64_t key, uint64_t& out_row_id) const {
     if (!cur) return false;
 
     while (!cur->is_leaf) {
-        const auto* begin = cur->keys.data();
-        const auto* end = begin + cur->num_keys;
-        const size_t idx = static_cast<size_t>(std::upper_bound(begin, end, key) - begin);
+        const size_t idx = fast_upper_bound(cur->keys.data(), cur->num_keys, key);
         cur = cur->children[idx];
         if (!cur) return false;
     }
 
-    const auto* begin = cur->keys.data();
-    const auto* end = begin + cur->num_keys;
-    const auto* it = std::lower_bound(begin, end, key);
-    if (it != end && *it == key) {
-        out_row_id = cur->row_ids[static_cast<size_t>(it - begin)];
+    const size_t pos = fast_lower_bound(cur->keys.data(), cur->num_keys, key);
+    if (pos < cur->num_keys && cur->keys[pos] == key) {
+        out_row_id = cur->row_ids[pos];
         return true;
     }
     return false;
@@ -220,11 +246,9 @@ uint64_t AugmentedBTree::range_count_node(const Node* n, int64_t lo, int64_t hi)
         return n->count;
     }
     if (n->is_leaf) {
-        const auto* begin = n->keys.data();
-        const auto* end = begin + n->num_keys;
-        const auto* it_lo = std::lower_bound(begin, end, lo);
-        const auto* it_hi = std::upper_bound(it_lo, end, hi);
-        return static_cast<uint64_t>(it_hi - it_lo);
+        const size_t lo_idx = fast_lower_bound(n->keys.data(), n->num_keys, lo);
+        const size_t hi_idx = lo_idx + fast_upper_bound(n->keys.data() + lo_idx, n->num_keys - lo_idx, hi);
+        return static_cast<uint64_t>(hi_idx - lo_idx);
     }
     uint64_t sum = 0;
     for (uint16_t i = 0; i <= n->num_keys; ++i) {
@@ -243,9 +267,7 @@ int64_t AugmentedBTree::range_sum_i64_node(const Node* n, int64_t lo, int64_t hi
         return n->col_sum_i64[col];
     }
     if (n->is_leaf) {
-        const auto* begin = n->keys.data();
-        const auto* end = begin + n->num_keys;
-        const size_t start = static_cast<size_t>(std::lower_bound(begin, end, lo) - begin);
+        const size_t start = fast_lower_bound(n->keys.data(), n->num_keys, lo);
         int64_t sum = 0;
         for (size_t i = start; i < n->num_keys && n->keys[i] <= hi; ++i) {
             sum += n->row_i64[i][col];
@@ -269,9 +291,7 @@ double AugmentedBTree::range_sum_f64_node(const Node* n, int64_t lo, int64_t hi,
         return n->col_sum_f64[col];
     }
     if (n->is_leaf) {
-        const auto* begin = n->keys.data();
-        const auto* end = begin + n->num_keys;
-        const size_t start = static_cast<size_t>(std::lower_bound(begin, end, lo) - begin);
+        const size_t start = fast_lower_bound(n->keys.data(), n->num_keys, lo);
         double sum = 0.0;
         for (size_t i = start; i < n->num_keys && n->keys[i] <= hi; ++i) {
             sum += n->row_f64[i][col];
@@ -333,43 +353,62 @@ void AugmentedBTree::scan_all(std::vector<std::pair<int64_t, uint64_t>>& out) co
 // ----------------------------------------------------------------------------
 
 AugmentedBTree::InsertResult AugmentedBTree::insert_recursive(
-    const Node* n,
+    Node* n,
     int64_t key,
     uint64_t row_id,
     const std::array<int64_t, MAX_AGG_COLS>& i64_vals,
-    const std::array<double, MAX_AGG_COLS>& f64_vals) {
+    const std::array<double, MAX_AGG_COLS>& f64_vals,
+    uint64_t batch_gen) {
+
+    const bool can_mutate =
+        (batch_gen != 0 && n->batch_gen == batch_gen &&
+         n->refcount.load(std::memory_order_relaxed) == 1);
 
     if (n->is_leaf) {
-        const auto* begin = n->keys.data();
-        const auto* end = begin + n->num_keys;
-        const size_t pos = static_cast<size_t>(std::lower_bound(begin, end, key) - begin);
+        const size_t pos = fast_lower_bound(n->keys.data(), n->num_keys, key);
 
-        // Update existing key in cloned leaf
+        // Update existing key with O(1) incremental aggregate delta
         if (pos < n->num_keys && n->keys[pos] == key) {
-            Node* clone = clone_node(n);
-            clone->row_ids[pos] = row_id;
-            clone->row_i64[pos] = i64_vals;
-            clone->row_f64[pos] = f64_vals;
-            recompute_aggregates(clone);
-            return {clone, nullptr, 0, false};
+            Node* target = can_mutate ? n : clone_node(n, batch_gen);
+            InsertResult res{};
+            res.left = target;
+            res.delta_count = 0;
+            for (size_t c = 0; c < MAX_AGG_COLS; ++c) {
+                const int64_t di = i64_vals[c] - target->row_i64[pos][c];
+                const double df = f64_vals[c] - target->row_f64[pos][c];
+                res.delta_i64[c] = di;
+                res.delta_f64[c] = df;
+                target->col_sum_i64[c] += di;
+                target->col_sum_f64[c] += df;
+            }
+            target->row_ids[pos] = row_id;
+            target->row_i64[pos] = i64_vals;
+            target->row_f64[pos] = f64_vals;
+            return res;
         }
 
-        // Insert into non-full leaf
+        // Insert into non-full leaf with O(1) incremental aggregate delta
         if (n->num_keys < ORDER) {
-            Node* clone = clone_node(n);
-            for (size_t i = clone->num_keys; i > pos; --i) {
-                clone->keys[i] = clone->keys[i - 1];
-                clone->row_ids[i] = clone->row_ids[i - 1];
-                clone->row_i64[i] = clone->row_i64[i - 1];
-                clone->row_f64[i] = clone->row_f64[i - 1];
+            Node* target = can_mutate ? n : clone_node(n, batch_gen);
+            for (size_t i = target->num_keys; i > pos; --i) {
+                target->keys[i] = target->keys[i - 1];
+                target->row_ids[i] = target->row_ids[i - 1];
+                target->row_i64[i] = target->row_i64[i - 1];
+                target->row_f64[i] = target->row_f64[i - 1];
             }
-            clone->keys[pos] = key;
-            clone->row_ids[pos] = row_id;
-            clone->row_i64[pos] = i64_vals;
-            clone->row_f64[pos] = f64_vals;
-            ++clone->num_keys;
-            recompute_aggregates(clone);
-            return {clone, nullptr, 0, false};
+            target->keys[pos] = key;
+            target->row_ids[pos] = row_id;
+            target->row_i64[pos] = i64_vals;
+            target->row_f64[pos] = f64_vals;
+            ++target->num_keys;
+            ++target->count;
+            if (key < target->min_key) target->min_key = key;
+            if (key > target->max_key) target->max_key = key;
+            for (size_t c = 0; c < MAX_AGG_COLS; ++c) {
+                target->col_sum_i64[c] += i64_vals[c];
+                target->col_sum_f64[c] += f64_vals[c];
+            }
+            return {target, nullptr, 0, false, 1, i64_vals, f64_vals};
         }
 
         // Split full leaf
@@ -398,6 +437,7 @@ AugmentedBTree::InsertResult AugmentedBTree::insert_recursive(
         constexpr size_t mid = (ORDER + 1) / 2;
         Node* left = alloc_node();
         left->is_leaf = true;
+        left->batch_gen = batch_gen;
         left->num_keys = static_cast<uint16_t>(mid);
         for (size_t i = 0; i < mid; ++i) {
             left->keys[i] = tmp_keys[i];
@@ -408,6 +448,7 @@ AugmentedBTree::InsertResult AugmentedBTree::insert_recursive(
 
         Node* right = alloc_node();
         right->is_leaf = true;
+        right->batch_gen = batch_gen;
         right->num_keys = static_cast<uint16_t>((ORDER + 1) - mid);
         for (size_t i = mid; i < ORDER + 1; ++i) {
             right->keys[i - mid] = tmp_keys[i];
@@ -418,38 +459,53 @@ AugmentedBTree::InsertResult AugmentedBTree::insert_recursive(
 
         recompute_aggregates(left);
         recompute_aggregates(right);
-        return {left, right, right->keys[0], true};
+        return {left, right, right->keys[0], true, 1, i64_vals, f64_vals};
     }
 
     // Internal node
-    const auto* begin = n->keys.data();
-    const auto* end = begin + n->num_keys;
-    const size_t idx = static_cast<size_t>(std::upper_bound(begin, end, key) - begin);
+    const size_t idx = fast_upper_bound(n->keys.data(), n->num_keys, key);
 
-    InsertResult child_res = insert_recursive(n->children[idx], key, row_id, i64_vals, f64_vals);
+    InsertResult child_res = insert_recursive(
+        n->children[idx], key, row_id, i64_vals, f64_vals, batch_gen);
 
     if (!child_res.did_split) {
-        Node* clone = clone_node(n);
-        release_node(clone->children[idx]);
-        clone->children[idx] = child_res.left;
-        recompute_aggregates(clone);
-        return {clone, nullptr, 0, false};
+        Node* target = can_mutate ? n : clone_node(n, batch_gen);
+        if (target->children[idx] != child_res.left) {
+            release_node(target->children[idx]);
+            target->children[idx] = child_res.left;
+        }
+        target->count += child_res.delta_count;
+        if (key < target->min_key) target->min_key = key;
+        if (key > target->max_key) target->max_key = key;
+        for (size_t c = 0; c < MAX_AGG_COLS; ++c) {
+            target->col_sum_i64[c] += child_res.delta_i64[c];
+            target->col_sum_f64[c] += child_res.delta_f64[c];
+        }
+        return {target, nullptr, 0, false,
+                child_res.delta_count, child_res.delta_i64, child_res.delta_f64};
     }
 
     if (n->num_keys < ORDER) {
-        Node* clone = clone_node(n);
-        release_node(clone->children[idx]);
+        Node* target = can_mutate ? n : clone_node(n, batch_gen);
+        release_node(target->children[idx]);
 
-        for (size_t i = clone->num_keys; i > idx; --i) {
-            clone->keys[i] = clone->keys[i - 1];
-            clone->children[i + 1] = clone->children[i];
+        for (size_t i = target->num_keys; i > idx; --i) {
+            target->keys[i] = target->keys[i - 1];
+            target->children[i + 1] = target->children[i];
         }
-        clone->keys[idx] = child_res.split_key;
-        clone->children[idx] = child_res.left;
-        clone->children[idx + 1] = child_res.right;
-        ++clone->num_keys;
-        recompute_aggregates(clone);
-        return {clone, nullptr, 0, false};
+        target->keys[idx] = child_res.split_key;
+        target->children[idx] = child_res.left;
+        target->children[idx + 1] = child_res.right;
+        ++target->num_keys;
+        target->count += child_res.delta_count;
+        if (key < target->min_key) target->min_key = key;
+        if (key > target->max_key) target->max_key = key;
+        for (size_t c = 0; c < MAX_AGG_COLS; ++c) {
+            target->col_sum_i64[c] += child_res.delta_i64[c];
+            target->col_sum_f64[c] += child_res.delta_f64[c];
+        }
+        return {target, nullptr, 0, false,
+                child_res.delta_count, child_res.delta_i64, child_res.delta_f64};
     }
 
     // Split full internal node
@@ -482,6 +538,7 @@ AugmentedBTree::InsertResult AugmentedBTree::insert_recursive(
 
     Node* left = alloc_node();
     left->is_leaf = false;
+    left->batch_gen = batch_gen;
     left->num_keys = static_cast<uint16_t>(mid);
     for (size_t i = 0; i < mid; ++i) {
         left->keys[i] = tmp_keys[i];
@@ -492,6 +549,7 @@ AugmentedBTree::InsertResult AugmentedBTree::insert_recursive(
 
     Node* right = alloc_node();
     right->is_leaf = false;
+    right->batch_gen = batch_gen;
     right->num_keys = static_cast<uint16_t>(ORDER - mid);
     for (size_t i = mid + 1; i <= ORDER; ++i) {
         right->keys[i - (mid + 1)] = tmp_keys[i];
@@ -502,34 +560,165 @@ AugmentedBTree::InsertResult AugmentedBTree::insert_recursive(
 
     recompute_aggregates(left);
     recompute_aggregates(right);
-    return {left, right, promoted_key, true};
+    return {left, right, promoted_key, true,
+            child_res.delta_count, child_res.delta_i64, child_res.delta_f64};
+}
+
+AugmentedBTree::Node* AugmentedBTree::bulk_load_empty(const std::vector<BatchEntry>& entries) {
+    if (entries.empty()) return nullptr;
+
+    // Fast path: check if entries are already strictly sorted (no duplicates).
+    bool strictly_sorted = true;
+    for (size_t i = 1; i < entries.size(); ++i) {
+        if (entries[i - 1].key >= entries[i].key) {
+            strictly_sorted = false;
+            break;
+        }
+    }
+
+    std::vector<const BatchEntry*> sorted_ptrs;
+    size_t n_unique = entries.size();
+    if (!strictly_sorted) {
+        sorted_ptrs.resize(entries.size());
+        for (size_t i = 0; i < entries.size(); ++i) {
+            sorted_ptrs[i] = &entries[i];
+        }
+        std::stable_sort(sorted_ptrs.begin(), sorted_ptrs.end(),
+                         [](const BatchEntry* a, const BatchEntry* b) {
+                             return a->key < b->key;
+                         });
+        // Deduplicate: last-wins for identical keys.
+        size_t write_idx = 0;
+        for (size_t i = 0; i < sorted_ptrs.size(); ++i) {
+            if (i + 1 < sorted_ptrs.size() && sorted_ptrs[i]->key == sorted_ptrs[i + 1]->key) {
+                continue;
+            }
+            sorted_ptrs[write_idx++] = sorted_ptrs[i];
+        }
+        sorted_ptrs.resize(write_idx);
+        n_unique = write_idx;
+    }
+
+    auto get_entry = [&](size_t idx) -> const BatchEntry& {
+        return strictly_sorted ? entries[idx] : *sorted_ptrs[idx];
+    };
+
+    // Pack leaf nodes directly (28/32 fill factor leaves headroom for future inserts).
+    constexpr size_t LEAF_FILL = 28;
+    const size_t num_leaves = (n_unique + LEAF_FILL - 1) / LEAF_FILL;
+    std::vector<Node*> level;
+    level.reserve(num_leaves);
+
+    for (size_t l = 0; l < num_leaves; ++l) {
+        const size_t start = l * LEAF_FILL;
+        const size_t end = std::min(start + LEAF_FILL, n_unique);
+        const size_t cnt = end - start;
+
+        Node* leaf = alloc_node();
+        leaf->is_leaf = true;
+        leaf->batch_gen = 0;
+        leaf->num_keys = static_cast<uint16_t>(cnt);
+        leaf->count = cnt;
+        leaf->min_key = get_entry(start).key;
+        leaf->max_key = get_entry(end - 1).key;
+        leaf->col_sum_i64.fill(0);
+        leaf->col_sum_f64.fill(0.0);
+
+        for (size_t j = 0; j < cnt; ++j) {
+            const BatchEntry& e = get_entry(start + j);
+            leaf->keys[j] = e.key;
+            leaf->row_ids[j] = e.row_id;
+            leaf->row_i64[j] = e.i64_vals;
+            leaf->row_f64[j] = e.f64_vals;
+            for (size_t c = 0; c < MAX_AGG_COLS; ++c) {
+                leaf->col_sum_i64[c] += e.i64_vals[c];
+                leaf->col_sum_f64[c] += e.f64_vals[c];
+            }
+        }
+        level.push_back(leaf);
+    }
+
+    // Build internal levels bottom-up in O(N) time with zero path-copying.
+    constexpr size_t INTERNAL_FILL_CHILDREN = 29; // 28 separator keys <= ORDER (32)
+    while (level.size() > 1) {
+        const size_t total = level.size();
+        const size_t num_parents = (total + INTERNAL_FILL_CHILDREN - 1) / INTERNAL_FILL_CHILDREN;
+        std::vector<Node*> next_level;
+        next_level.reserve(num_parents);
+
+        size_t offset = 0;
+        for (size_t p = 0; p < num_parents; ++p) {
+            const size_t remaining_children = total - offset;
+            const size_t remaining_parents = num_parents - p;
+            // Avoid a 1-child trailing internal node by balancing the final two parents.
+            size_t cnt = std::min(INTERNAL_FILL_CHILDREN, remaining_children);
+            if (remaining_parents == 2 && remaining_children == INTERNAL_FILL_CHILDREN + 1) {
+                cnt = remaining_children / 2;
+            }
+
+            Node* parent = alloc_node();
+            parent->is_leaf = false;
+            parent->batch_gen = 0;
+            parent->num_keys = static_cast<uint16_t>(cnt - 1);
+            parent->count = 0;
+            parent->min_key = level[offset]->min_key;
+            parent->max_key = level[offset + cnt - 1]->max_key;
+            parent->col_sum_i64.fill(0);
+            parent->col_sum_f64.fill(0.0);
+
+            for (size_t j = 0; j < cnt; ++j) {
+                Node* child = level[offset + j];
+                parent->children[j] = child;
+                if (j > 0) {
+                    parent->keys[j - 1] = child->min_key;
+                }
+                parent->count += child->count;
+                for (size_t c = 0; c < MAX_AGG_COLS; ++c) {
+                    parent->col_sum_i64[c] += child->col_sum_i64[c];
+                    parent->col_sum_f64[c] += child->col_sum_f64[c];
+                }
+            }
+            offset += cnt;
+            next_level.push_back(parent);
+        }
+        level = std::move(next_level);
+    }
+
+    return level[0];
 }
 
 AugmentedBTree::Node* AugmentedBTree::upsert_into_root(
-    const Node* root,
+    Node* root,
     int64_t key,
     uint64_t row_id,
     const std::array<int64_t, MAX_AGG_COLS>& i64_vals,
-    const std::array<double, MAX_AGG_COLS>& f64_vals) {
+    const std::array<double, MAX_AGG_COLS>& f64_vals,
+    uint64_t batch_gen) {
     if (!root) {
         Node* leaf = alloc_node();
         leaf->is_leaf = true;
+        leaf->batch_gen = batch_gen;
         leaf->num_keys = 1;
         leaf->keys[0] = key;
         leaf->row_ids[0] = row_id;
         leaf->row_i64[0] = i64_vals;
         leaf->row_f64[0] = f64_vals;
-        recompute_aggregates(leaf);
+        leaf->count = 1;
+        leaf->min_key = key;
+        leaf->max_key = key;
+        leaf->col_sum_i64 = i64_vals;
+        leaf->col_sum_f64 = f64_vals;
         return leaf;
     }
 
-    InsertResult res = insert_recursive(root, key, row_id, i64_vals, f64_vals);
+    InsertResult res = insert_recursive(root, key, row_id, i64_vals, f64_vals, batch_gen);
     if (!res.did_split) {
         return res.left;
     }
 
     Node* new_root = alloc_node();
     new_root->is_leaf = false;
+    new_root->batch_gen = batch_gen;
     new_root->num_keys = 1;
     new_root->keys[0] = res.split_key;
     new_root->children[0] = res.left;
@@ -544,7 +733,7 @@ void AugmentedBTree::upsert(int64_t key,
                             const std::array<double, MAX_AGG_COLS>& f64_vals) {
     std::lock_guard<std::mutex> lk(write_mu_);
     Node* old_root = root_.load(std::memory_order_acquire);
-    Node* new_root = upsert_into_root(old_root, key, row_id, i64_vals, f64_vals);
+    Node* new_root = upsert_into_root(old_root, key, row_id, i64_vals, f64_vals, 0);
     root_.store(new_root, std::memory_order_release);
     retire_root(old_root);
 }
@@ -554,12 +743,23 @@ void AugmentedBTree::upsert_batch(const std::vector<BatchEntry>& entries) {
 
     std::lock_guard<std::mutex> lk(write_mu_);
     Node* old_root = root_.load(std::memory_order_acquire);
+
+    // O(N) bottom-up bulk load when inserting into an empty tree.
+    if (old_root == nullptr) {
+        Node* new_root = bulk_load_empty(entries);
+        root_.store(new_root, std::memory_order_release);
+        return;
+    }
+
+    // In-place batch mutation for non-empty trees: nodes created with cur_gen
+    // are mutated in-place without re-cloning until the batch root is published.
+    const uint64_t cur_gen = ++next_batch_gen_;
     Node* working_root = old_root;
 
     for (const auto& entry : entries) {
         Node* next_root = upsert_into_root(
-            working_root, entry.key, entry.row_id, entry.i64_vals, entry.f64_vals);
-        if (working_root != old_root) {
+            working_root, entry.key, entry.row_id, entry.i64_vals, entry.f64_vals, cur_gen);
+        if (next_root != working_root && working_root != old_root) {
             release_node(working_root);
         }
         working_root = next_root;
@@ -571,10 +771,8 @@ void AugmentedBTree::upsert_batch(const std::vector<BatchEntry>& entries) {
 
 AugmentedBTree::Node* AugmentedBTree::erase_recursive(const Node* n, int64_t key, bool& found) {
     if (n->is_leaf) {
-        const auto* begin = n->keys.data();
-        const auto* end = begin + n->num_keys;
-        const auto* it = std::lower_bound(begin, end, key);
-        if (it == end || *it != key) {
+        const size_t pos = fast_lower_bound(n->keys.data(), n->num_keys, key);
+        if (pos >= n->num_keys || n->keys[pos] != key) {
             found = false;
             return nullptr;
         }
@@ -582,7 +780,6 @@ AugmentedBTree::Node* AugmentedBTree::erase_recursive(const Node* n, int64_t key
         if (n->num_keys == 1) {
             return nullptr;
         }
-        const size_t pos = static_cast<size_t>(it - begin);
         Node* clone = clone_node(n);
         for (size_t i = pos; i + 1 < clone->num_keys; ++i) {
             clone->keys[i] = clone->keys[i + 1];
@@ -595,9 +792,7 @@ AugmentedBTree::Node* AugmentedBTree::erase_recursive(const Node* n, int64_t key
         return clone;
     }
 
-    const auto* begin = n->keys.data();
-    const auto* end = begin + n->num_keys;
-    const size_t idx = static_cast<size_t>(std::upper_bound(begin, end, key) - begin);
+    const size_t idx = fast_upper_bound(n->keys.data(), n->num_keys, key);
 
     Node* new_child = erase_recursive(n->children[idx], key, found);
     if (!found) {

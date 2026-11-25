@@ -33,6 +33,16 @@ std::vector<uint32_t> filter_column_f64(
     const uint8_t* live = nullptr
 );
 
+/// Fast hardware-popcount count of matching int64_t rows without materializing indices.
+uint64_t filter_count_i64(
+    const int64_t* data,
+    size_t count,
+    int64_t rhs,
+    CmpOp op,
+    const uint8_t* nulls = nullptr,
+    const uint8_t* live = nullptr
+) noexcept;
+
 /// Vectorized 64-element chunk mask helper for i64.
 inline uint64_t filter_chunk_mask_i64(const int64_t* data, size_t count, int64_t rhs, CmpOp op) noexcept {
     return zephyr::cpp26::simd::filter_chunk_i64(data, count, rhs, op);

@@ -77,6 +77,7 @@ private:
         std::atomic<uint32_t> refcount{1};
         bool is_leaf = true;
         uint16_t num_keys = 0;
+        uint64_t batch_gen = 0;
 
         // Augmented aggregates over this subtree
         uint64_t count = 0;
@@ -102,6 +103,9 @@ private:
         Node* right = nullptr;
         int64_t split_key = 0;
         bool did_split = false;
+        uint64_t delta_count = 0;
+        std::array<int64_t, MAX_AGG_COLS> delta_i64{};
+        std::array<double, MAX_AGG_COLS> delta_f64{};
     };
 
     struct NodePool {
@@ -127,22 +131,26 @@ private:
     static void release_node(Node* n) noexcept;
     static void rcu_node_deleter(void* p);
 
-    static Node* clone_node(const Node* src);
+    static Node* clone_node(const Node* src, uint64_t batch_gen = 0);
     static void recompute_aggregates(Node* n) noexcept;
 
+    static Node* bulk_load_empty(const std::vector<BatchEntry>& entries);
+
     static Node* upsert_into_root(
-        const Node* root,
+        Node* root,
         int64_t key,
         uint64_t row_id,
         const std::array<int64_t, MAX_AGG_COLS>& i64_vals,
-        const std::array<double, MAX_AGG_COLS>& f64_vals);
+        const std::array<double, MAX_AGG_COLS>& f64_vals,
+        uint64_t batch_gen = 0);
 
     static InsertResult insert_recursive(
-        const Node* n,
+        Node* n,
         int64_t key,
         uint64_t row_id,
         const std::array<int64_t, MAX_AGG_COLS>& i64_vals,
-        const std::array<double, MAX_AGG_COLS>& f64_vals);
+        const std::array<double, MAX_AGG_COLS>& f64_vals,
+        uint64_t batch_gen = 0);
 
     static Node* erase_recursive(const Node* n, int64_t key, bool& found);
 
@@ -155,6 +163,7 @@ private:
 
     std::atomic<Node*> root_{nullptr};
     std::mutex write_mu_;
+    uint64_t next_batch_gen_ = 0;
     RcuReaper* reaper_ = nullptr;
     cpp26::rcu::rcu_domain& domain_;
 };

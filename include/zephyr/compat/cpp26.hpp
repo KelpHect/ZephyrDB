@@ -52,6 +52,10 @@
   #endif
 #endif
 
+#if defined(_WIN32)
+extern "C" __declspec(dllimport) void __stdcall FlushProcessWriteBuffers(void);
+#endif
+
 namespace zephyr::cpp26 {
 
 // ============================================================================
@@ -100,6 +104,19 @@ public:
     }
 
     uint64_t enter_read(reader_slot* slot) noexcept {
+#if defined(_WIN32)
+        // Asymmetric RCU: FlushProcessWriteBuffers() on the writer/reclaimer side
+        // provides the cross-thread memory barrier, so readers only need a compiler
+        // signal fence instead of an expensive seq_cst hardware fence (XCHG/MFENCE).
+        uint64_t g = global_epoch_.load(std::memory_order_relaxed);
+        if (slot) {
+            slot->epoch.store((g << 1) | 1ULL, std::memory_order_relaxed);
+            std::atomic_signal_fence(std::memory_order_seq_cst);
+        } else {
+            fallback_readers_.fetch_add(1, std::memory_order_seq_cst);
+        }
+        return g;
+#else
         uint64_t g = global_epoch_.load(std::memory_order_acquire);
         if (slot) {
             slot->epoch.store((g << 1) | 1ULL, std::memory_order_seq_cst);
@@ -107,14 +124,24 @@ public:
             fallback_readers_.fetch_add(1, std::memory_order_seq_cst);
         }
         return g;
+#endif
     }
 
     void exit_read(reader_slot* slot) noexcept {
+#if defined(_WIN32)
+        if (slot) {
+            std::atomic_signal_fence(std::memory_order_seq_cst);
+            slot->epoch.store(0, std::memory_order_relaxed);
+        } else {
+            fallback_readers_.fetch_sub(1, std::memory_order_release);
+        }
+#else
         if (slot) {
             slot->epoch.store(0, std::memory_order_release);
         } else {
             fallback_readers_.fetch_sub(1, std::memory_order_release);
         }
+#endif
     }
 
     void retire(void* ptr, void (*deleter)(void*)) {
@@ -125,6 +152,10 @@ public:
     }
 
     size_t poll_reclaim() {
+        {
+            std::lock_guard<std::mutex> lk(retire_mu_);
+            if (retired_.empty()) return 0;
+        }
         std::vector<retired_node> ready;
         uint64_t min_active = min_active_epoch();
         {
@@ -172,6 +203,11 @@ public:
 
 private:
     uint64_t min_active_epoch() const noexcept {
+#if defined(_WIN32)
+        // Issue a process-wide memory barrier (IPI) so all relaxed reader
+        // epoch stores/loads are globally ordered before we scan slots_.
+        ::FlushProcessWriteBuffers();
+#endif
         while (fallback_readers_.load(std::memory_order_acquire) > 0) {
             std::this_thread::yield();
         }
@@ -218,24 +254,42 @@ public:
     scoped_read_lock& operator=(const scoped_read_lock&) = delete;
 
 private:
-    static rcu_domain::reader_slot* get_local_slot(rcu_domain& dom) noexcept {
-        struct slot_holder {
-            rcu_domain* dom = nullptr;
-            rcu_domain::reader_slot* slot = nullptr;
-            ~slot_holder() {
-                if (dom && slot) dom->release_thread_slot(slot);
-            }
-        };
-        thread_local slot_holder holder;
-        if (holder.dom == &dom && holder.slot) {
-            return holder.slot;
+    struct slot_holder {
+        rcu_domain* dom = nullptr;
+        rcu_domain::reader_slot* slot = nullptr;
+        ~slot_holder() {
+            if (dom && slot) dom->release_thread_slot(slot);
         }
+    };
+
+    static rcu_domain::reader_slot* acquire_local_slot_slow(
+        rcu_domain& dom,
+        rcu_domain*& cached_dom,
+        rcu_domain::reader_slot*& cached_slot) noexcept {
+        thread_local slot_holder holder;
         if (holder.dom == nullptr) {
             holder.dom = &dom;
             holder.slot = dom.acquire_thread_slot();
+            cached_dom = &dom;
+            cached_slot = holder.slot;
+            return holder.slot;
+        }
+        if (holder.dom == &dom) {
+            cached_dom = &dom;
+            cached_slot = holder.slot;
             return holder.slot;
         }
         return nullptr;
+    }
+
+    static inline rcu_domain::reader_slot* get_local_slot(rcu_domain& dom) noexcept {
+        // Trivial thread_local pointers avoid TLS init-guard overhead on the hot path.
+        static thread_local rcu_domain* cached_dom = nullptr;
+        static thread_local rcu_domain::reader_slot* cached_slot = nullptr;
+        if (cached_dom == &dom) [[likely]] {
+            return cached_slot;
+        }
+        return acquire_local_slot_slow(dom, cached_dom, cached_slot);
     }
 
     rcu_domain* domain_;

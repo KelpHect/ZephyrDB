@@ -14,10 +14,12 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -79,11 +81,29 @@ struct Table {
 
     std::unique_ptr<Table> clone_data(zephyr::core::RcuReaper* reaper) const;
     int find_col(std::string_view col_name) const;
+    int find_col_nocase(std::string_view col_name) const noexcept;
+};
+
+struct CatalogSnapshot {
+    std::vector<std::pair<std::string, Table*>> tables;
+
+    Table* find(std::string_view lower_name) const noexcept;
+};
+
+struct CompiledO1Plan {
+    struct Item {
+        bool is_count{false};
+        std::string col_lower;
+        std::string label;
+    };
+    std::string table_lower;
+    std::vector<Item> items;
 };
 
 struct PreparedStmt {
     std::string sql;
     std::vector<Stmt> stmts;
+    std::optional<CompiledO1Plan> o1_plan;
 };
 
 class ZephyrEngine {
@@ -187,6 +207,7 @@ private:
 
     void rebuild_btree(Table& tbl);
     void update_btree_for_row(Table& tbl, size_t row_idx);
+    void publish_catalog_snapshot();
 
     void log_wal_entry(std::string_view sql);
     bool load_snapshot(const std::string& snap_path);
@@ -205,6 +226,7 @@ private:
     zephyr::storage::Compactor compactor_;
 
     std::unordered_map<std::string, std::unique_ptr<Table>> tables_;
+    std::atomic<CatalogSnapshot*> catalog_snap_{nullptr};
 
     std::atomic<bool> in_txn_{false};
     bool in_replay_{false};

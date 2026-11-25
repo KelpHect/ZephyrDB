@@ -16,12 +16,124 @@ namespace zephyr::sql {
 
 namespace {
 
+// ============================================================================
+// Thread-Local + Global Fallback Arena Slab Pool
+// ============================================================================
+
+class GlobalArenaPool {
+public:
+    static constexpr size_t MAX_GLOBAL = 64;
+
+    GlobalArenaPool() = default;
+    ~GlobalArenaPool() {
+        alive_.store(false, std::memory_order_release);
+        std::lock_guard<std::mutex> lk(mu_);
+        for (auto* a : pool_) {
+            delete a;
+        }
+        pool_.clear();
+    }
+
+    GlobalArenaPool(const GlobalArenaPool&) = delete;
+    GlobalArenaPool& operator=(const GlobalArenaPool&) = delete;
+
+    zephyr::core::Arena* try_pop() {
+        if (!alive_.load(std::memory_order_acquire)) return nullptr;
+        std::lock_guard<std::mutex> lk(mu_);
+        if (pool_.empty()) return nullptr;
+        auto* a = pool_.back();
+        pool_.pop_back();
+        return a;
+    }
+
+    bool try_push(zephyr::core::Arena* a) {
+        if (!alive_.load(std::memory_order_acquire)) return false;
+        std::lock_guard<std::mutex> lk(mu_);
+        if (pool_.size() >= MAX_GLOBAL) return false;
+        pool_.push_back(a);
+        return true;
+    }
+
+private:
+    std::atomic<bool> alive_{true};
+    std::mutex mu_;
+    std::vector<zephyr::core::Arena*> pool_;
+};
+
+GlobalArenaPool& global_arena_pool() {
+    static GlobalArenaPool pool;
+    return pool;
+}
+
+struct ThreadArenaCache {
+    static constexpr size_t MAX_LOCAL = 8;
+
+    zephyr::core::Arena* slots[MAX_LOCAL]{};
+    size_t count{0};
+
+    ~ThreadArenaCache() {
+        for (size_t i = 0; i < count; ++i) {
+            delete slots[i];
+        }
+        count = 0;
+    }
+};
+
+thread_local ThreadArenaCache tls_arena_cache;
+
+zephyr::core::Arena* acquire_arena(size_t slab_bytes) {
+    if (tls_arena_cache.count > 0) {
+        return tls_arena_cache.slots[--tls_arena_cache.count];
+    }
+    if (auto* a = global_arena_pool().try_pop()) {
+        return a;
+    }
+    return new zephyr::core::Arena(slab_bytes);
+}
+
+void release_arena(zephyr::core::Arena* arena) noexcept {
+    if (!arena) return;
+    if (arena->slab_count() > 4) {
+        delete arena;
+        return;
+    }
+    arena->reset();
+    if (tls_arena_cache.count < ThreadArenaCache::MAX_LOCAL) {
+        tls_arena_cache.slots[tls_arena_cache.count++] = arena;
+        return;
+    }
+    if (!global_arena_pool().try_push(arena)) {
+        delete arena;
+    }
+}
+
 std::string to_lower(std::string_view sv) {
     std::string out(sv);
     for (char& c : out) {
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     }
     return out;
+}
+
+std::string_view to_lower_sv(std::string_view sv, char* buf, size_t buf_cap, std::string& heap_fallback) {
+    if (sv.size() <= buf_cap) {
+        for (size_t i = 0; i < sv.size(); ++i) {
+            buf[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(sv[i])));
+        }
+        return std::string_view(buf, sv.size());
+    }
+    heap_fallback = to_lower(sv);
+    return heap_fallback;
+}
+
+bool iequals_ascii(std::string_view a, std::string_view b) noexcept {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        unsigned char ca = static_cast<unsigned char>(a[i]);
+        unsigned char cb = static_cast<unsigned char>(b[i]);
+        if (std::tolower(ca) != std::tolower(cb)) return false;
+    }
+    return true;
 }
 
 Value from_c_value(const ZephyrValue& zv) {
@@ -282,6 +394,36 @@ int Table::find_col(std::string_view col_name) const {
     return static_cast<int>(it->second);
 }
 
+int Table::find_col_nocase(std::string_view col_name) const noexcept {
+    for (size_t i = 0; i < schema.size(); ++i) {
+        if (iequals_ascii(schema[i].name, col_name)) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+Table* CatalogSnapshot::find(std::string_view lower_name) const noexcept {
+    const size_t n = tables.size();
+    if (n <= 8) {
+        for (size_t i = 0; i < n; ++i) {
+            if (tables[i].first == lower_name) {
+                return tables[i].second;
+            }
+        }
+        return nullptr;
+    }
+    auto it = std::lower_bound(
+        tables.begin(), tables.end(), lower_name,
+        [](const std::pair<std::string, Table*>& entry, std::string_view key) {
+            return std::string_view(entry.first) < key;
+        });
+    if (it != tables.end() && std::string_view(it->first) == lower_name) {
+        return it->second;
+    }
+    return nullptr;
+}
+
 std::unique_ptr<Table> Table::clone_data(zephyr::core::RcuReaper* reaper) const {
     auto copy = std::make_unique<Table>();
     copy->name = name;
@@ -307,6 +449,7 @@ ZephyrEngine::ZephyrEngine(const ZephyrConfig& cfg) : config_(cfg) {
         config_.arena_slab_bytes = 65536;
     }
     reaper_.start(2);
+    publish_catalog_snapshot();
 
     if (cfg.data_dir && cfg.data_dir[0] != '\0') {
         data_dir_ = cfg.data_dir;
@@ -346,16 +489,32 @@ ZephyrEngine::~ZephyrEngine() {
         wal_.close();
     }
     mmap_store_.close_mmap();
+    CatalogSnapshot* snap = catalog_snap_.exchange(nullptr, std::memory_order_acq_rel);
+    delete snap;
     tables_.clear();
     txn_backup_.clear();
     reaper_.stop();
+}
+
+void ZephyrEngine::publish_catalog_snapshot() {
+    auto* next = new CatalogSnapshot();
+    next->tables.reserve(tables_.size());
+    for (const auto& [k, tbl] : tables_) {
+        next->tables.emplace_back(k, tbl.get());
+    }
+    std::sort(next->tables.begin(), next->tables.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    CatalogSnapshot* old = catalog_snap_.exchange(next, std::memory_order_acq_rel);
+    if (old) {
+        reaper_.retire_obj(old);
+    }
 }
 
 void ZephyrEngine::free_result(ZephyrResultSet* result) {
     if (!result) return;
     auto* arena = static_cast<zephyr::core::Arena*>(result->_arena_handle);
     if (arena) {
-        delete arena;
+        release_arena(arena);
     }
 }
 
@@ -415,6 +574,48 @@ std::unique_ptr<PreparedStmt> ZephyrEngine::prepare(std::string_view sql) {
     auto ps = std::make_unique<PreparedStmt>();
     ps->sql = std::string(sql);
     ps->stmts = std::move(parsed.stmts);
+
+    // Pre-compile O(1) aggregate fastpath plan for single-table COUNT(*)/SUM(col) SELECTs
+    if (ps->stmts.size() == 1 && std::holds_alternative<SelectStmt>(ps->stmts[0])) {
+        const auto& s = std::get<SelectStmt>(ps->stmts[0]);
+        if (s.ctes.empty() && s.from.has_value() && s.joins.empty() &&
+            !s.where && s.group_by.empty() && !s.limit.has_value() &&
+            !s.offset.has_value() && !s.items.empty()) {
+            CompiledO1Plan plan;
+            plan.table_lower = to_lower(s.from->table_name);
+            plan.items.reserve(s.items.size());
+            bool all_o1 = true;
+
+            for (size_t i = 0; i < s.items.size(); ++i) {
+                const auto& item = s.items[i];
+                if (item.is_star || !item.expr ||
+                    !std::holds_alternative<AggregateExpr>(item.expr->node)) {
+                    all_o1 = false;
+                    break;
+                }
+                const auto& agg = std::get<AggregateExpr>(item.expr->node);
+                std::string label = item.alias.empty()
+                    ? infer_expr_name(item.expr.get(), i) : item.alias;
+
+                if (agg.func == AggFunc::Count && agg.is_star) {
+                    plan.items.push_back(CompiledO1Plan::Item{true, {}, std::move(label)});
+                } else if (agg.func == AggFunc::Sum && agg.arg &&
+                           std::holds_alternative<ColumnRefExpr>(agg.arg->node)) {
+                    const auto& cref = std::get<ColumnRefExpr>(agg.arg->node);
+                    plan.items.push_back(CompiledO1Plan::Item{
+                        false, to_lower(cref.column), std::move(label)});
+                } else {
+                    all_o1 = false;
+                    break;
+                }
+            }
+
+            if (all_o1 && !plan.items.empty()) {
+                ps->o1_plan = std::move(plan);
+            }
+        }
+    }
+
     return ps;
 }
 
@@ -424,6 +625,93 @@ ZephyrResultSet* ZephyrEngine::query_prepared(
     uint32_t param_count
 ) {
     clear_error();
+
+    // Lock-free RCU O(1) fastpath: zero shared_mutex, zero std::vector/std::string allocations
+    if (stmt.o1_plan.has_value() && !in_txn_.load(std::memory_order_acquire)) {
+        const auto& plan = *stmt.o1_plan;
+        const size_t n = plan.items.size();
+        constexpr size_t STACK_CAP = 16;
+
+        if (n <= STACK_CAP) {
+            ColumnType out_types[STACK_CAP];
+            int64_t out_i64[STACK_CAP];
+            double out_f64[STACK_CAP];
+            bool ok = true;
+
+            for (size_t i = 0; i < n; ++i) {
+                // Each btree->total_*() acquires its own inner scoped_read_lock on default_domain(),
+                // whose destructor clears the thread's RCU slot epoch. Opening a fresh guard per
+                // item ensures snap and tbl are never dereferenced after an inner guard exits.
+                cpp26::rcu::scoped_read_lock rcu_guard(reaper_.domain());
+                const CatalogSnapshot* snap = catalog_snap_.load(std::memory_order_acquire);
+                const Table* tbl = snap ? snap->find(plan.table_lower) : nullptr;
+                if (!tbl) {
+                    ok = false;
+                    break;
+                }
+
+                const auto& item = plan.items[i];
+                if (item.is_count) {
+                    out_types[i] = ColumnType::I64;
+                    out_i64[i] = static_cast<int64_t>(tbl->btree->total_count());
+                } else {
+                    auto cit = tbl->col_map.find(item.col_lower);
+                    if (cit == tbl->col_map.end()) {
+                        ok = false;
+                        break;
+                    }
+                    const ColumnSchema& cs = tbl->schema[cit->second];
+                    if (cs.agg_slot < 0) {
+                        ok = false;
+                        break;
+                    }
+                    const size_t slot = static_cast<size_t>(cs.agg_slot);
+                    if (cs.type == ColumnType::I64) {
+                        out_types[i] = ColumnType::I64;
+                        out_i64[i] = tbl->btree->total_sum_i64(slot);
+                    } else if (cs.type == ColumnType::F64) {
+                        out_types[i] = ColumnType::F64;
+                        out_f64[i] = tbl->btree->total_sum_f64(slot);
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+
+            if (ok) {
+                auto* arena = acquire_arena(static_cast<size_t>(config_.arena_slab_bytes));
+                auto* rs = arena->create<ZephyrResultSet>();
+                rs->_arena_handle = arena;
+                rs->status = ZEPHYR_OK;
+                rs->flags = ZEPHYR_FLAG_O1_FASTPATH;
+                rs->rows_affected = 0;
+                rs->col_count = n;
+                rs->row_count = 1;
+
+                auto* cols = arena->alloc_array<ZephyrColumnDesc>(n);
+                auto* vals = arena->alloc_array<ZephyrValue>(n);
+                for (size_t i = 0; i < n; ++i) {
+                    cols[i].name = arena->dup_cstr(plan.items[i].label);
+                    cols[i].name_len = static_cast<uint32_t>(plan.items[i].label.size());
+                    cols[i].type = static_cast<int32_t>(out_types[i]);
+
+                    vals[i]._pad = 0;
+                    if (out_types[i] == ColumnType::I64) {
+                        vals[i].type = ZEPHYR_TYPE_I64;
+                        vals[i].as.i64 = out_i64[i];
+                    } else {
+                        vals[i].type = ZEPHYR_TYPE_F64;
+                        vals[i].as.f64 = out_f64[i];
+                    }
+                }
+                rs->columns = cols;
+                rs->values = vals;
+                return rs;
+            }
+        }
+    }
+
     return execute_stmts(stmt.sql, stmt.stmts, params, param_count);
 }
 
@@ -496,45 +784,94 @@ ZephyrResultSet* ZephyrEngine::execute_stmts(
 }
 
 ZephyrAggregate ZephyrEngine::aggregate_count(std::string_view table_name) {
-    std::shared_lock<std::shared_mutex> lk(mu_);
     ZephyrAggregate agg{};
-    auto it = tables_.find(to_lower(table_name));
-    if (it == tables_.end()) {
+    char lower_buf[128];
+    std::string lower_heap;
+    std::string_view key = to_lower_sv(table_name, lower_buf, sizeof(lower_buf), lower_heap);
+
+    cpp26::rcu::scoped_read_lock rcu_guard(reaper_.domain());
+    const CatalogSnapshot* snap = catalog_snap_.load(std::memory_order_acquire);
+    const Table* tbl = snap ? snap->find(key) : nullptr;
+    if (!tbl) {
         agg.status = ZEPHYR_ERR_NOT_FOUND;
         set_error("table not found: " + std::string(table_name));
         return agg;
     }
-    agg.count = static_cast<int64_t>(it->second->btree->total_count());
+    agg.count = static_cast<int64_t>(tbl->btree->total_count());
     agg.status = ZEPHYR_OK;
     return agg;
 }
 
 ZephyrAggregate ZephyrEngine::aggregate_sum(std::string_view table_name, std::string_view col_name) {
-    std::shared_lock<std::shared_mutex> lk(mu_);
     ZephyrAggregate agg{};
-    auto it = tables_.find(to_lower(table_name));
-    if (it == tables_.end()) {
-        agg.status = ZEPHYR_ERR_NOT_FOUND;
-        set_error("table not found: " + std::string(table_name));
-        return agg;
-    }
-    const Table& tbl = *it->second;
-    int col_idx = tbl.find_col(col_name);
-    if (col_idx < 0) {
-        agg.status = ZEPHYR_ERR_NOT_FOUND;
-        set_error("column not found: " + std::string(col_name));
-        return agg;
-    }
-    agg.count = static_cast<int64_t>(tbl.btree->total_count());
-    const ColumnSchema& cs = tbl.schema[col_idx];
-    if (cs.agg_slot >= 0) {
-        if (cs.type == ColumnType::I64) {
-            agg.sum_i64 = tbl.btree->total_sum_i64(static_cast<size_t>(cs.agg_slot));
-            agg.sum_f64 = static_cast<double>(agg.sum_i64);
-        } else if (cs.type == ColumnType::F64) {
-            agg.sum_f64 = tbl.btree->total_sum_f64(static_cast<size_t>(cs.agg_slot));
+    char lower_buf[128];
+    std::string lower_heap;
+    std::string_view key = to_lower_sv(table_name, lower_buf, sizeof(lower_buf), lower_heap);
+
+    bool need_fallback_scan = false;
+    {
+        cpp26::rcu::scoped_read_lock rcu_guard(reaper_.domain());
+        const CatalogSnapshot* snap = catalog_snap_.load(std::memory_order_acquire);
+        const Table* tbl = snap ? snap->find(key) : nullptr;
+        if (!tbl) {
+            agg.status = ZEPHYR_ERR_NOT_FOUND;
+            set_error("table not found: " + std::string(table_name));
+            return agg;
         }
-    } else if (cs.type == ColumnType::I64 || cs.type == ColumnType::F64) {
+        int col_idx = tbl->find_col_nocase(col_name);
+        if (col_idx < 0) {
+            agg.status = ZEPHYR_ERR_NOT_FOUND;
+            set_error("column not found: " + std::string(col_name));
+            return agg;
+        }
+        const ColumnSchema& cs = tbl->schema[col_idx];
+        if (cs.agg_slot >= 0) {
+            const size_t slot = static_cast<size_t>(cs.agg_slot);
+            if (cs.type == ColumnType::I64) {
+                agg.sum_i64 = tbl->btree->total_sum_i64(slot);
+                agg.sum_f64 = static_cast<double>(agg.sum_i64);
+            } else if (cs.type == ColumnType::F64) {
+                agg.sum_f64 = tbl->btree->total_sum_f64(slot);
+            } else {
+                agg.status = ZEPHYR_ERR_INVALID_ARG;
+                set_error("SUM requires numeric column");
+                return agg;
+            }
+            // Re-establish RCU read lock for total_count() after inner guard exit
+            cpp26::rcu::scoped_read_lock rcu_guard2(reaper_.domain());
+            const CatalogSnapshot* snap2 = catalog_snap_.load(std::memory_order_acquire);
+            const Table* tbl2 = snap2 ? snap2->find(key) : nullptr;
+            if (tbl2) {
+                agg.count = static_cast<int64_t>(tbl2->btree->total_count());
+            }
+            agg.status = ZEPHYR_OK;
+            return agg;
+        } else if (cs.type == ColumnType::I64 || cs.type == ColumnType::F64) {
+            need_fallback_scan = true;
+        } else {
+            agg.status = ZEPHYR_ERR_INVALID_ARG;
+            set_error("SUM requires numeric column");
+            return agg;
+        }
+    }
+
+    if (need_fallback_scan) {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        auto it = tables_.find(std::string(key));
+        if (it == tables_.end()) {
+            agg.status = ZEPHYR_ERR_NOT_FOUND;
+            set_error("table not found: " + std::string(table_name));
+            return agg;
+        }
+        const Table& tbl = *it->second;
+        int col_idx = tbl.find_col_nocase(col_name);
+        if (col_idx < 0) {
+            agg.status = ZEPHYR_ERR_NOT_FOUND;
+            set_error("column not found: " + std::string(col_name));
+            return agg;
+        }
+        const ColumnSchema& cs = tbl.schema[col_idx];
+        agg.count = static_cast<int64_t>(tbl.btree->total_count());
         for (size_t r = 0; r < tbl.live.size(); ++r) {
             if (!tbl.live[r] || tbl.columns[col_idx].nulls[r]) continue;
             if (cs.type == ColumnType::I64) {
@@ -544,10 +881,6 @@ ZephyrAggregate ZephyrEngine::aggregate_sum(std::string_view table_name, std::st
             }
         }
         if (cs.type == ColumnType::I64) agg.sum_f64 = static_cast<double>(agg.sum_i64);
-    } else {
-        agg.status = ZEPHYR_ERR_INVALID_ARG;
-        set_error("SUM requires numeric column");
-        return agg;
     }
     agg.status = ZEPHYR_OK;
     return agg;
@@ -599,7 +932,7 @@ void ZephyrEngine::clear_error() {
 
 ZephyrResultSet* ZephyrEngine::make_error_result(uint32_t status, const std::string& msg) {
     set_error(msg);
-    auto* arena = new zephyr::core::Arena(4096);
+    auto* arena = acquire_arena(static_cast<size_t>(config_.arena_slab_bytes));
     auto* rs = arena->create<ZephyrResultSet>();
     rs->row_count = 0;
     rs->col_count = 0;
@@ -619,7 +952,7 @@ ZephyrResultSet* ZephyrEngine::pack_result(
     uint64_t rows_affected,
     uint32_t flags
 ) {
-    auto* arena = new zephyr::core::Arena(static_cast<size_t>(config_.arena_slab_bytes));
+    auto* arena = acquire_arena(static_cast<size_t>(config_.arena_slab_bytes));
     auto* rs = arena->create<ZephyrResultSet>();
     rs->_arena_handle = arena;
     rs->status = ZEPHYR_OK;
@@ -904,13 +1237,20 @@ ZephyrResultSet* ZephyrEngine::exec_txn(const TxnStmt& s) {
     if (!in_txn_) {
         return pack_result({}, {}, {}, 0, 0);
     }
+    auto old_tables = std::move(tables_);
     tables_ = std::move(txn_backup_);
     for (auto& [k, tbl] : tables_) {
         rebuild_btree(*tbl);
     }
+    publish_catalog_snapshot();
+    for (auto& [k, old_tbl] : old_tables) {
+        if (old_tbl) {
+            reaper_.retire_obj(old_tbl.release());
+        }
+    }
     txn_backup_.clear();
     txn_wal_buffer_.clear();
-    in_txn_ = false;
+    in_txn_.store(false, std::memory_order_release);
     return pack_result({}, {}, {}, 0, 0);
 }
 
@@ -952,6 +1292,7 @@ ZephyrResultSet* ZephyrEngine::exec_create_table(const CreateTableStmt& s) {
     }
 
     tables_[key] = std::move(tbl);
+    publish_catalog_snapshot();
     return pack_result({}, {}, {}, 0, 0);
 }
 
@@ -964,7 +1305,12 @@ ZephyrResultSet* ZephyrEngine::exec_drop_table(const DropTableStmt& s) {
         }
         return make_error_result(ZEPHYR_ERR_NOT_FOUND, "table not found: " + s.table_name);
     }
+    std::unique_ptr<Table> dropped = std::move(it->second);
     tables_.erase(it);
+    publish_catalog_snapshot();
+    if (dropped) {
+        reaper_.retire_obj(dropped.release());
+    }
     return pack_result({}, {}, {}, 0, 0);
 }
 
@@ -1588,7 +1934,7 @@ ZephyrResultSet* ZephyrEngine::exec_select(
             size_t row_count = end_idx - start_idx;
             size_t col_count = fast_names.size();
 
-            auto* arena = new zephyr::core::Arena(static_cast<size_t>(config_.arena_slab_bytes));
+            auto* arena = acquire_arena(static_cast<size_t>(config_.arena_slab_bytes));
             auto* rs = arena->create<ZephyrResultSet>();
             rs->_arena_handle = arena;
             rs->status = ZEPHYR_OK;
@@ -2265,6 +2611,7 @@ bool ZephyrEngine::load_snapshot(const std::string& snap_path) {
 
         tables_[to_lower(tname)] = std::move(tbl);
     }
+    publish_catalog_snapshot();
     return true;
 }
 
